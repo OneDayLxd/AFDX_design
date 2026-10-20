@@ -1,0 +1,25 @@
+# ModelSim 编译库：仅忽略生成的库，不忽略源码和配置。
+/2-sim/work/
+/lint_work/
+
+# 仿真生成的日志、波形和诊断文件。
+/2-sim/*.log
+/2-sim/*.wlf
+/2-sim/*.vcd
+/2-sim/*.fsdb
+/2-sim/*.fst
+/2-sim/*.vstf
+/2-sim/vsim.dbg
+/2-sim/modelsim.ini
+/2-sim/transcript
+/transcript
+
+# 仿真生成的抓包和延迟统计结果，不影响 1-tb/stimuli 中的输入文件。
+/2-sim/capture.txt
+/2-sim/latency.csv
+
+# 根目录 modelsim.ini、.vscode/settings.json 和 .vscode/lint.f 为项目配置，需保留。
+
+# Python 缓存。
+__pycache__/
+*.py[cod]

@@ -1,0 +1,138 @@
+/*
+ * ================================================================
+ * File Name    : afdx_snmp_mib.vh
+ * Module Name  : none
+ *
+ * Function:
+ *   自动生成文件：由 scripts/gen_snmp_mib.py 生成，请勿手工修改。
+ *
+ * Sub Module:
+ *   none
+ *
+ * ================================================================
+ */
+
+`ifndef AFDX_SNMP_MIB_VH
+`define AFDX_SNMP_MIB_VH
+`define MIB_ENTRIES 7'd114
+`define MIB_SYSDESCR 7'd0
+`define MIB_SYSOBJECTID 7'd1
+`define MIB_SYSUPTIME 7'd2
+`define MIB_SYSNAME 7'd3
+`define MIB_ESFWVERSION 7'd4
+`define MIB_ESBUILDID 7'd5
+`define MIB_ESIDENTITY 7'd6
+`define MIB_ESMONOTONICUS 7'd7
+`define MIB_TXMSGS 7'd8
+`define MIB_TXFRAMES 7'd9
+`define MIB_TXFRAMESA 7'd10
+`define MIB_TXFRAMESB 7'd11
+`define MIB_TXLMAXDROP 7'd12
+`define MIB_TXOVFDROP 7'd13
+`define MIB_RXFRAMESA 7'd14
+`define MIB_RXFRAMESB 7'd15
+`define MIB_RXFCSERR 7'd16
+`define MIB_RXMACLENERR 7'd17
+`define MIB_RXMACOVF 7'd18
+`define MIB_RXHDRERR 7'd19
+`define MIB_RXLENERR 7'd20
+`define MIB_RXVLUNKNOWN 7'd21
+`define MIB_RXCSUMERR 7'd22
+`define MIB_RXFULLDROP 7'd23
+`define MIB_RXICDROP 7'd24
+`define MIB_RXRMDROP 7'd25
+`define MIB_RXACCEPTED 7'd26
+`define MIB_RXDELIVERED 7'd27
+`define MIB_TXBUFUSED 7'd28
+`define MIB_TXBUFPEAK 7'd29
+`define MIB_RXBUFUSED 7'd30
+`define MIB_RXBUFPEAK 7'd31
+`define MIB_RXERRTOTAL 7'd32
+`define MIB_STATSCLEAR 7'd33
+`define MIB_VLID 7'd34
+`define MIB_VLBAGUS 7'd35
+`define MIB_VLLMAX 7'd36
+`define MIB_VLNETEN 7'd37
+`define MIB_VLSHADOWBAGUS 7'd38
+`define MIB_VLSHADOWLMAX 7'd39
+`define MIB_VLSHADOWNETEN 7'd40
+`define MIB_VLROMLMAX 7'd41
+`define MIB_CFGGENERATION 7'd42
+`define MIB_CFGCOMMAND 7'd43
+`define MIB_CFGACTIVEBANK 7'd44
+`define MIB_CFGLASTRESULT 7'd45
+`define MIB_CFGBUDGET 7'd46
+`define MIB_LDSTATE 7'd47
+`define MIB_LDOBJECT 7'd48
+`define MIB_LDBYTES 7'd49
+`define MIB_LDBLOCK 7'd50
+`define MIB_LDCRCEXPECTED 7'd51
+`define MIB_LDCRCACTUAL 7'd52
+`define MIB_LDLASTERROR 7'd53
+`define MIB_LDFAILBLOCK 7'd54
+`define MIB_LDCFGVERSION 7'd55
+`define MIB_LDAPPBANK 7'd56
+`define MIB_LDAPPLENGTH 7'd57
+`define MIB_LDAPPVERSION 7'd58
+`define MIB_LDABORT 7'd59
+`define MIB_LDLOADS 7'd60
+`define MIB_LDUNLOADS 7'd61
+`define MIB_LDAPPCRC 7'd62
+`define MIB_RTCTIME 7'd63
+`define MIB_RTCTIMELOW 7'd64
+`define MIB_RTCSTATE 7'd65
+`define MIB_RTCLASTOFFSET 7'd66
+`define MIB_RTCMAXABSOFFSET 7'd67
+`define MIB_RTCPATHDELAY 7'd68
+`define MIB_RTCFREQCORR 7'd69
+`define MIB_RTCSYNCAGE 7'd70
+`define MIB_RTCSYNCS 7'd71
+`define MIB_RTCSTEPS 7'd72
+`define MIB_RTCSLEWS 7'd73
+`define MIB_RTCSOURCESWITCHES 7'd74
+`define MIB_RTCLOST 7'd75
+`define MIB_RTCDUPLICATE 7'd76
+`define MIB_RTCOUTOFORDER 7'd77
+`define MIB_RTCBADFORMAT 7'd78
+`define MIB_RTCTIMEOUTS 7'd79
+`define MIB_RTCREJECTED 7'd80
+`define MIB_RTCLASTSEQ 7'd81
+`define MIB_RTCSOURCEID 7'd82
+`define MIB_RTCSOURCEQUALITY 7'd83
+`define MIB_RTCLASTERROR 7'd84
+`define MIB_RTCSTEPTHRESHOLD 7'd85
+`define MIB_RTCHOLDOVERUS 7'd86
+`define MIB_RTCUNSYNCUS 7'd87
+`define MIB_RTCONEWAYDELAY 7'd88
+`define MIB_RTCSET 7'd89
+`define MIB_RTCLASTSYNCMONO 7'd90
+`define MIB_TRAPMASK 7'd91
+`define MIB_TRAPINTERVALMS 7'd92
+`define MIB_TRAPDSTPORT 7'd93
+`define MIB_SNMPPORT 7'd94
+`define MIB_TRAPSENT 7'd95
+`define MIB_TRAPDROPPED 7'd96
+`define MIB_TRAPEVENTTYPE 7'd97
+`define MIB_TRAPEVENTCOUNT 7'd98
+`define MIB_TRAPEVENTFIRST 7'd99
+`define MIB_TRAPEVENTLAST 7'd100
+`define MIB_MGMTRXACCEPTED 7'd101
+`define MIB_MGMTRXDROPFULL 7'd102
+`define MIB_MGMTRXDROPPORT 7'd103
+`define MIB_SNMPINPKTS 7'd104
+`define MIB_SNMPINBADCOMMUNITY 7'd105
+`define MIB_SNMPINPARSEERRS 7'd106
+`define MIB_SNMPOUTPKTS 7'd107
+`define MIB_ERRTHRESHOLD 7'd108
+`define MIB_LINKTIMEOUTMS 7'd109
+`define MIB_RTCPORT 7'd110
+`define MIB_TFTPRETRIES 7'd111
+`define MIB_TFTPERRORS 7'd112
+`define MIB_SNMPTRAPOID 7'd113
+`define TRAP_LINKCHANGE 3'd1
+`define TRAP_RXERRORS 3'd2
+`define TRAP_BUFFERHIGH 3'd3
+`define TRAP_LOADERFAULT 3'd4
+`define TRAP_RTCFAULT 3'd5
+`define TRAP_CFGCHANGE 3'd6
+`endif

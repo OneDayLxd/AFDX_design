@@ -1,0 +1,23 @@
+生成方式：内置 imagegen，创建一张架构图并进行两次局部修订。
+用途：帮助理解当前 AFDX RTL；不表示标准认证或竞赛验收已完成。
+
+初始绘图要求：
+绘制中文横向工程架构图，标题 AFDX_design：当前 RTL 设计架构。
+AFDX_top 边界内包含应用接口、afdx_mgmt_plane 管理面、VL 配置、afdx_es_core 收发核心和顶层总线适配。
+应用发生器 afdx_app_gen 接入 afdx_app_mux；管理响应也接入此仲裁器。
+TX 从左到右：afdx_msg_queue → afdx_bag_scheduler → afdx_frame_builder → afdx_redundancy_ctrl → afdx_mac_tx ×2。
+RX 从右到左：afdx_mac_rx → afdx_rx_arb / afdx_rx_parser → afdx_rx_integrity → afdx_msg_queue → afdx_rx_deliver。
+交付后的接收流连接 afdx_app_sink，并将管理请求送往管理请求缓冲。
+管理面简化为请求缓冲 → 服务引擎 → 响应缓冲，服务包含 SNMP、TFTP/加载卸载子集、RTC 时间同步。
+VL 配置简化为静态 ROM 和运行时双银行 RAM；正式配置 128 TX VL / 4096 RX VL；以虚线表示参数和配置更新。
+核心 TX_A / TX_B 在顶层按帧复用为单条 8 位总线，100 MHz、每 8 拍一个字节。
+顶层 RX 只有一个入口，接到核心 A 接收入口；B 接收入口未接入。
+外部只画 ModelSim Testbench，展示回环、报文注入和自动检查；TX 和 RX 箭头分别标注实际顶层信号。
+不得把自定义帧字节总线标成标准 GMII；不得把两个独立物理 A/B 网络或 PHY 画为已接通；不得声称完整标准符合性。
+底部注明 MAC 帧处理已实现、未接真实 PHY、A/B 顶层共用一条总线、管理协议为当前实现子集且验收口径待确认。
+
+修订一：
+管理响应箭头必须从响应缓冲出发，回到 afdx_app_mux，不能从请求缓冲出发；保留其他节点与连线。
+
+修订二：
+消除管理请求注释的文字重叠；只保留一行“管理请求”，放在绿色水平线下方的空白区域，删除括号说明；其他内容不变。

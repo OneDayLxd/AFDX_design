@@ -5,6 +5,7 @@
  *
  * Function:
  *   接收交付模块：轮询各接收 VL 队列，把队首消息以字节流形式交付给应用（主机）接口。
+ *   可选占用摘要跳过连续空组，保持逐 VL 轮询及回绕顺序。
  *
  * Sub Module:
  *   afdx_rr_arbiter
@@ -21,7 +22,8 @@ module afdx_rx_deliver #(
     // 1: 非空位来自队列的分组 RAM（ne_group -> ne_bits，1 拍读延迟），
     //    不再对 N_VL 位向量做 N_VL/16:1 的 16 位宽选择。
     parameter NONEMPTY_RAM = 0,
-    parameter REGISTER_RESET = 0
+    parameter REGISTER_RESET = 0,
+    parameter SUMMARY_ENABLE = 0
 ) (
     input  wire               clk,
     input  wire               rst,
@@ -47,7 +49,8 @@ module afdx_rx_deliver #(
     input  wire               msg_ready,
     output reg  [SLOT_AW-1:0] msg_len,
     output reg  [MW-1:0]      msg_meta,
-    output reg                stat_deliver
+    output reg                stat_deliver,
+    input  wire [(N_VL+255)/256-1:0] ne_regions
 );
     `include "afdx_math.vh"
     localparam S_IDLE = 3'd0, S_SETUP = 3'd1, S_STREAM = 3'd2,
@@ -104,10 +107,15 @@ module afdx_rx_deliver #(
     // Prefetch the next group each clock. Its RAM bits, local pick, and
     // controller decision occupy separate registered stages.
     // 本模块出队后的清零最迟在 S_DRAIN 结束时写入，S_IDLE 起的读取不会看到过期的置位。
+    // 区边界可跳过 16 个空组。起始区仍逐组扫描，保留 rr_lane 的
+    // 上半段/回绕下半段顺序及终止标记；不足 256 VL 的尾区也逐组扫描。
+    wire skip_region = SUMMARY_ENABLE != 0 &&
+        (scan_group % 16 == 0) && (scan_group / 16 != rr_group / 16) &&
+        (scan_group + 16 < GROUPS) && !ne_regions[scan_group / 16];
     wire [GW-1:0] next_scan_group =
         (state == S_IDLE) ? rr_group :
         (state == S_SCAN_GROUP) ?
-            ((scan_at_last) ? {GW{1'b0}} : scan_group + 1'b1) :
+            ((scan_at_last) ? {GW{1'b0}} : scan_group + (skip_region ? 16 : 1)) :
         scan_group;
     generate if (NONEMPTY_RAM != 0) begin : g_ne_ram
         assign group_bits = ne_bits;

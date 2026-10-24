@@ -5,11 +5,14 @@
  *
  * Function:
  *   VL 发送调度器（流量整形）：为每个发送 VL 维护一个 BAG 定时器，
- *   队列非空且 BAG 定时器到期的 VL 为可发送 VL；多个可发送 VL 之间采用轮询仲裁，
- *   授权在接受前保持稳定；实际总线出口的 BAG 由各 MAC 再次约束。
- *   参考软件模型 RegulatorLogic：首帧立即发送并启动 BAG 计时，计时期间到达的消息排队等待。
+ *   队列非空且 BAG 定时器到期的 VL 为可发送 VL；非时隙模式采用快照轮询仲裁，
+ *   默认轮询授权在接受前保持稳定；实际总线出口的 BAG 由各 MAC 再次约束。
+ *   可选相位模式取时隙与 BAG 的交集；闭窗时撤销尚未接受的授权。
+ *   本轮无剩余可服务候选时再接纳新候选，减少指针前方的新到达流越过旧候选。
+ *   授权后启动 BAG 计时，期间到达的同 VL 消息仍按 FIFO 排队等待。
  *
  * Sub Module:
+ *   afdx_phase_gate
  *   afdx_first16
  *   afdx_rr_arbiter
  *
@@ -18,9 +21,13 @@
 
 `timescale 1ns/1ps
 module afdx_bag_scheduler #(
-    parameter N_VL = 8,
-    parameter VLW  = 3,
-    parameter BAGW = 20                        // BAG 计数位宽（微秒，最大 128000）
+    parameter N_VL                = 8,
+    parameter VLW                 = 3,
+    parameter BAGW                = 20,        // BAG 计数位宽（微秒，最大 128000）
+    parameter PHASE_ENABLE        = 0,
+    parameter PHASE_SLOT_CYCLES   = 8000,
+    parameter PHASE_OPEN_CYCLE    = 7500,
+    parameter PHASE_WINDOW_CYCLES = 125
 ) (
     input  wire            clk,
     input  wire            rst,
@@ -80,7 +87,46 @@ module afdx_bag_scheduler #(
         end
     endgenerate
 
-    wire [N_VL-1:0] elig = nonempty & bag_open;
+    wire [N_VL-1:0] phase_permit;
+    wire phase_open;
+    wire [VLW-1:0] phase_vl;
+    generate if (PHASE_ENABLE != 0) begin : g_phase
+        afdx_phase_gate #(
+            .N_VL          (N_VL),
+            .VLW           (VLW),
+            .SLOT_CYCLES   (PHASE_SLOT_CYCLES),
+            .OPEN_CYCLE    (PHASE_OPEN_CYCLE),
+            .WINDOW_CYCLES (PHASE_WINDOW_CYCLES)
+        ) u_gate (
+            .clk           (clk),
+            .rst           (rst),
+            .grant_ack     (grant_ack),
+            .grant_vl      (grant_vl),
+            .permit        (phase_permit),
+            .window_open   (phase_open),
+            .window_vl     (phase_vl)
+        );
+    end else begin : g_no_phase
+        assign phase_permit = {N_VL{1'b1}};
+        assign phase_open = 1'b1;
+        assign phase_vl = {VLW{1'b0}};
+    end endgenerate
+    wire [N_VL-1:0] eligible_now = nonempty & bag_open & phase_permit;
+    reg  [N_VL-1:0] round_pending;
+    wire round_empty = ~|(round_pending & eligible_now);
+    generate for (g = 0; g < N_VL; g = g + 1) begin : g_snapshot
+        always @(posedge clk) begin
+            if (rst) round_pending[g] <= 1'b0;
+            else if (grant_ack && grant_group_oh[g/16] && grant_lane_oh[g%16])
+                round_pending[g] <= 1'b0;
+            // 接受授权的这一拍不重载，避免把刚接受的 VL 当作下一轮候选。
+            else if (round_empty && !grant_ack) round_pending[g] <= eligible_now[g];
+        end
+    end endgenerate
+    // 仲裁数据通路仅增加逐位掩码；轮次更新用位图归约，不比较 128 路年龄。
+    // 时隙模式仍由相位窗口独占选路，不叠加快照轮次。
+    wire [N_VL-1:0] elig = eligible_now &
+                           ((PHASE_ENABLE != 0) ? {N_VL{1'b1}} : round_pending);
 
     // Registered round robin: M rr_ptr masks, A1 eligibility, S1 first
     // eligible VL in each 16-VL group, S2 group choice, S3 VL number. A grant
@@ -210,13 +256,14 @@ module afdx_bag_scheduler #(
                 rr_ptr            <= (grant_vl == N_VL - 1) ? {VLW{1'b0}} : grant_vl + 1'b1;
                 grant_valid       <= 1'b0;
                 hold              <= HOLD[HW-1:0];
-            end else if (queue_pop) begin
-                // The frame builder has just released a message and cannot
-                // accept a grant on this clock. Re-arbitrate afterwards.
+            end else if (queue_pop || (PHASE_ENABLE != 0 && grant_valid && (!phase_open || phase_vl != grant_vl))) begin
+                // 出队或窗口失效后清理旧候选；已被组帧器确认的授权以上一分支为准。
                 grant_valid       <= 1'b0;
                 hold              <= HOLD[HW-1:0];
             end else if (!grant_valid && hold == 0) begin
-                grant_valid <= found_s3;
+                // 重新核对当前窗口，不能接受流水线中上个窗口的旧候选。
+                // 用 VL 比较而非 128 位掩码的动态选位，缩短授权寄存器前路径。
+                grant_valid <= found_s3 && (PHASE_ENABLE == 0 || (phase_open && phase_vl == pick_s3));
                 grant_vl    <= pick_s3;
                 grant_lane_oh <= 16'd1 << (pick_s3 % 16);
             end

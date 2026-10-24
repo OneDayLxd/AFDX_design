@@ -1,5 +1,6 @@
 integer tb_checks = 0;
 integer tb_errors = 0;
+bit tb_done = 0;
 
 task automatic tb_check(input logic condition, input string message);
     begin
@@ -24,9 +25,10 @@ endfunction
 
 task automatic tb_finish(input string test_name);
     begin
-        if (tb_errors == 0)
+        if (tb_errors == 0) begin
+            tb_done = 1;
             $display("%s: %0d checks, 0 errors -> PASS", test_name, tb_checks);
-        else begin
+        end else begin
             $display("%s: %0d checks, %0d errors -> FAIL", test_name, tb_checks, tb_errors);
             $fatal(1, "%s failed", test_name);
         end

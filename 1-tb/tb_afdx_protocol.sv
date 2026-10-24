@@ -44,6 +44,28 @@ module tb_afdx_protocol;
         .SKEW_MAX_US(50), .UDP_CSUM_EN(1), .IC_EN(1), .RM_EN(1),
         .IFG(12), .MAC_FIFO_AW(11), .RX_GAP_CYCLES(4)
     ) dut (
+        .cnt_rx_mac_error          (),
+        .mgmt_window               (),
+        .mac_a_tx_last             (),
+        .mac_a_wire_sof            (1'b0),
+        .mac_a_wire_done           (1'b0),
+        .mac_a_rx_last             (1'b0),
+        .mac_a_rx_ready            (),
+        .mac_a_rx_ts               (32'd0),
+        .mac_a_rx_good_count       (32'd0),
+        .mac_a_rx_error_count      (32'd0),
+        .mac_a_rx_length_count     (32'd0),
+        .mac_a_rx_overflow_count   (32'd0),
+        .mac_b_tx_last             (),
+        .mac_b_wire_sof            (1'b0),
+        .mac_b_wire_done           (1'b0),
+        .mac_b_rx_last             (1'b0),
+        .mac_b_rx_ready            (),
+        .mac_b_rx_ts               (32'd0),
+        .mac_b_rx_good_count       (32'd0),
+        .mac_b_rx_error_count      (32'd0),
+        .mac_b_rx_length_count     (32'd0),
+        .mac_b_rx_overflow_count   (32'd0),
         .clk(clk), .rst(rst),
         .tx_msg_vl(tx_msg_vl), .tx_msg_valid(tx_msg_valid), .tx_msg_data(tx_msg_data),
         .tx_msg_last(tx_msg_last), .tx_msg_ready(tx_msg_ready),
@@ -328,7 +350,9 @@ module tb_afdx_protocol;
     wire ic_resp, ic_accept, ic_stat_drop, rm_stat_drop;
     afdx_rx_integrity #(.N_VL(2), .VLW(1), .SKEW_MAX_US(50)) u_integrity (
         .clk(clk), .rst(rst), .now_us(ic_now), .req(ic_req), .vl(ic_vl), .net(ic_net), .sn(ic_sn),
-        .resp(ic_resp), .accept(ic_accept), .stat_ic_drop(ic_stat_drop), .stat_rm_drop(rm_stat_drop), .init_busy()
+        .resp(ic_resp), .accept(ic_accept), .stat_ic_drop(ic_stat_drop), .stat_rm_drop(rm_stat_drop), .init_busy(),
+        .delivery_done (1'b0),
+        .delivery_ok   (1'b0)
     );
 
     task automatic integrity_request(input integer net, input [7:0] sequence_value,

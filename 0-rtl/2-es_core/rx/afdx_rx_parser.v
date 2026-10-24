@@ -62,7 +62,7 @@ module afdx_rx_parser #(
     output reg             stat_csum_err,
     output reg             stat_full_drop
 );
-    localparam S_RX = 3'd0, S_DECIDE = 3'd1, S_WAIT = 3'd2, S_DONE = 3'd3, S_HEADER = 3'd4, S_ADDLEN=3'd5, S_FOLD=3'd6, S_FOLDEND=3'd7;
+    localparam S_RX = 3'd0, S_DECIDE = 3'd1, S_WAIT = 3'd2, S_DONE = 3'd3, S_FOLD=3'd6, S_FOLDEND=3'd7;
     reg [2:0]  state;
     reg [13:0] bi;                                  // 帧内字节索引
     reg [15:0] vlid, ip_len, udp_len, udp_csum_f;
@@ -119,11 +119,22 @@ module afdx_rx_parser #(
     // 校验和折叠
     reg [16:0] ip_f1, udp_f1;
     reg [15:0] ip_f2, udp_f2;
-    reg [31:0] udp_add, udp_t;
+    reg [31:0] udp_pseudo, udp_t;
     wire ip_csum_ok = ip_f2 == 16'hffff;
     wire udp_csum_ok = (UDP_CSUM_CHECK == 0) || (udp_csum_f == 0) || (udp_f2 == 16'hffff);
+    wire frame_reject = hdr_err || !ip_csum_ok || len_err || vl_unk || !udp_csum_ok || full_drop;
     wire [31:0] add_hi = {16'd0, in_data, 8'd0};
     wire [31:0] add_lo = {24'd0, in_data};
+    // 伪首部长度在载荷前已稳定；折叠流水与收帧并行，不在 EOF 后再串行加两项。
+    // SN 不参与 UDP 校验和，最后一个载荷在 SN 前一拍完成累加。
+    always @(posedge clk) begin
+        udp_pseudo <= {16'd0,udp_len}+32'd17;
+        udp_t <= udp_sum+udp_pseudo;
+        udp_f1 <= {1'b0,udp_t[15:0]}+{1'b0,udp_t[31:16]};
+        udp_f2 <= udp_f1[15:0]+udp_f1[16];
+        ip_f1 <= {1'b0,ip_sum[15:0]}+{1'b0,ip_sum[31:16]};
+        ip_f2 <= ip_f1[15:0]+ip_f1[16];
+    end
 
     always @(posedge clk) begin
         if (rst) begin
@@ -205,26 +216,14 @@ module afdx_rx_parser #(
                         if (in_last) begin
                             sn      <= in_data;
                             len_err <= ({2'b00, bi} != exp_last) || !len_consistent;
-                            state   <= S_HEADER;
+                            state   <= S_FOLD;
                         end
                     end
                 end
-                S_HEADER: begin
-                    udp_add <= udp_sum + 32'h11;
-                    ip_f1 <= {1'b0,ip_sum[15:0]} + {1'b0,ip_sum[31:16]};
-                    state <= S_ADDLEN;
-                end
-                S_ADDLEN: begin
-                    udp_t <= udp_add + udp_len;
-                    ip_f2 <= ip_f1[15:0] + ip_f1[16];
-                    state <= S_FOLD;
-                end
                 S_FOLD: begin
-                    udp_f1 <= {1'b0,udp_t[15:0]} + {1'b0,udp_t[31:16]};
                     state <= S_FOLDEND;
                 end
                 S_FOLDEND: begin
-                    udp_f2 <= udp_f1[15:0] + udp_f1[16];
                     state <= S_DECIDE;
                 end
                 S_DECIDE: begin
@@ -256,13 +255,18 @@ module afdx_rx_parser #(
                         state <= S_DONE;
                     end
                 end
-                S_DONE: begin                          // 清理，准备下一帧
+                S_DONE: begin
+                    state <= S_RX;
+                end
+            endcase
+            // 裁决返回时直接清理；下一帧首部可与队列 commit/abort 同拍处理。
+            // idx_l/sn/会话元数据保持到下一帧对应字段到达，供队列采样上一帧。
+            if ((state == S_DECIDE && frame_reject) || (state == S_WAIT && ic_resp)) begin
                     bi <= 14'd0;
                     hdr_flags <= 0; len_err <= 1'b0; vl_unk <= 1'b0; full_drop <= 1'b0;
                     ip_sum <= 32'd0; udp_sum <= 32'd0; pld_end <= 0;
                     state <= S_RX;
-                end
-            endcase
+            end
         end
     end
 endmodule

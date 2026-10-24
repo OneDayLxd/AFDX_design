@@ -1,5 +1,8 @@
 `timescale 1ns/1ps
 module tb_afdx_rx_arb;
+    // 批处理统一检查完成标志，避免提前 $fatal 被误判为成功。
+    integer tb_errors = 0;
+    bit tb_done = 0;
     reg clk = 0, rst = 1;
     always #5 clk = ~clk;
 
@@ -20,6 +23,9 @@ module tb_afdx_rx_arb;
     wire b_last = b_idx != 0;
 
     afdx_rx_arb dut (
+        .a_ts                      (32'd0),
+        .b_ts                      (32'd0),
+        .out_ts                    (),
         .clk(clk), .rst(rst),
         .a_data(a_data), .a_valid(a_valid), .a_last(a_last), .a_ready(a_ready),
         .b_data(b_data), .b_valid(b_valid), .b_last(b_last), .b_ready(b_ready),
@@ -66,6 +72,7 @@ module tb_afdx_rx_arb;
         if (a_idx != 3 || b_idx != 3 || out_valid)
             $fatal(1, "arbiter did not drain both sources");
         checks = checks + 1;
+        tb_done = 1;
         $display("tb_afdx_rx_arb: %0d checks, 0 errors -> PASS", checks);
         $finish;
     end

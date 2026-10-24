@@ -8,6 +8,7 @@
  *   完整性检查按 (VL, 网络) 维护前序序列号 PSN：接受 SN ∈ {PSN+1, PSN+2}（255 后回绕到 1）
  *     或 SN==0（发送端复位）；首帧无条件接受。PSN 无论是否转发都更新（与软件模型 IntegrityChecker 一致）。
  *   冗余管理按 VL 采用"先到有效者优先"：记录最近交付的 SN 及时间，
+ *   DEFER_COMMIT=1 时获准帧仅预约裁决，待消息池确认后更新状态；资源失败取消预约且不推进 PSN/RM。
  *     若 SN 比已交付的更新（模 255 前向窗口 1..127）或为发送端复位帧（SN=0 且上一帧非 0）则交付；
  *     相同或更旧且在 SkewMax 时间窗内则视为冗余副本丢弃；超过 SkewMax 无帧后重新同步。
  *   状态表全部放在同步 RAM 中（含 valid 位），复位后由清扫计数器逐项清零，
@@ -21,11 +22,12 @@
 
 `timescale 1ns/1ps
 module afdx_rx_integrity #(
-    parameter N_VL        = 8,
-    parameter VLW         = 3,
-    parameter IC_EN       = 1,
-    parameter RM_EN       = 1,
-    parameter SKEW_MAX_US = 10000
+    parameter N_VL         = 8,
+    parameter VLW          = 3,
+    parameter IC_EN        = 1,
+    parameter RM_EN        = 1,
+    parameter SKEW_MAX_US  = 10000,
+    parameter DEFER_COMMIT = 0
 ) (
     input  wire           clk,
     input  wire           rst,
@@ -38,7 +40,9 @@ module afdx_rx_integrity #(
     output reg            accept,
     output reg            stat_ic_drop,
     output reg            stat_rm_drop,
-    output wire           init_busy       // 复位后状态表清扫中
+    output wire           init_busy,      // 复位后状态表清扫中
+    input  wire           delivery_done,
+    input  wire           delivery_ok
 );
     // {valid, sn} 打包存放，valid 位随 RAM 一起清扫，不需要独立触发器阵列。
     (* ramstyle = "M4K, no_rw_check" *) reg [8:0]  psn     [0:2*N_VL-1];
@@ -62,7 +66,8 @@ module afdx_rx_integrity #(
     // One request is outstanding at a time; the parser waits for resp.
     // Snapshot the protocol time at admission, so added latency cannot change
     // the SkewMax decision at its boundary or across the microsecond wrap.
-    localparam IDLE=0, DIFF=1, AGE=2, CHECK=3, DECIDE=4, COMMIT=5, FETCH=6, HOLD=7;
+    localparam IDLE=0, DIFF=1, AGE=2, CHECK=3, PENDING=4, COMMIT=5, FETCH=6, HOLD=7;
+    localparam [31:0] SKEW_LIMIT = SKEW_MAX_US;
     reg [2:0] state;
     reg [VLW-1:0] vl_l;
     reg net_l;
@@ -72,7 +77,7 @@ module afdx_rx_integrity #(
     reg [16:0] age_lo;
     reg [15:0] age_hi_base, age_hi;
     reg [7:0] distance;
-    reg ic_ok, rm_seq_ok, expired, decision;
+    reg ic_ok, rm_seq_ok, age_low_greater, decision;
     wire [VLW:0] k = {vl_l, net_l};
     wire [7:0] nx1 = p == 255 ? 8'd1 : p+8'd1;
     wire [7:0] nx2 = p == 255 ? 8'd2 : (p == 254 ? 8'd1 : p+8'd2);
@@ -85,7 +90,11 @@ module afdx_rx_integrity #(
     // Dedicated, unreset synchronous read ports allow block RAM inference.
     // IDLE captures the request; FETCH consumes the matching RAM outputs.
     // There is one outstanding request, so COMMIT cannot collide with FETCH.
-    wire commit_write = (state == COMMIT) && !init_run;
+    // 已获准副本须等消息池提交成功才更新 PSN/RM；失败不得阻止另一网重试。
+    // IC/RM 拒绝的已校验帧仍立即更新该网 PSN，保留原有序列号规则。
+    wire commit_write = !init_run &&
+        (((state == COMMIT) && (DEFER_COMMIT == 0 || !decision)) ||
+         ((state == PENDING) && delivery_done && delivery_ok));
     // 单写口：清扫期间写地址来自计数器，其余时间来自当前请求。
     wire            psn_we   = init_run || commit_write;
     wire [VLW:0]    psn_wa   = init_run ? init_addr : k;
@@ -93,7 +102,9 @@ module afdx_rx_integrity #(
     wire            rm_we    = init_run || (commit_write && decision);
     wire [VLW-1:0]  rm_wa    = init_run ? init_addr[VLW-1:0] : vl_l;
     wire [8:0]      rm_sn_wd = init_run ? 9'd0 : {1'b1, sn_l};
-    wire [31:0]     rm_t_wd  = init_run ? 32'd0 : time_l;
+    // 后台复制可能长时间反压：事务模式以成功入队时刻记录交付，
+    // 不能把等待时间算成已交付后的 SkewMax 静默期而再次接受在途副本。
+    wire [31:0]     rm_t_wd  = init_run ? 32'd0 : (DEFER_COMMIT != 0 ? now_us : time_l);
     always @(posedge clk) begin
         psn_q     <= psn[rd_key];
         rm_sn_q   <= rm_sn[rd_vl];
@@ -111,7 +122,7 @@ module afdx_rx_integrity #(
             vl_l <= 0; net_l <= 0; sn_l <= 0; time_l <= 0;
             p <= 0; lsn <= 0; pv <= 0; rv <= 0; old_time <= 0;
             age_lo <= 0; age_hi_base <= 0; age_hi <= 0; distance <= 0;
-            ic_ok <= 0; rm_seq_ok <= 0; expired <= 0; decision <= 0;
+            ic_ok <= 0; rm_seq_ok <= 0; age_low_greater <= 0; decision <= 0;
         end else begin
             resp <= 0; accept <= 0; stat_ic_drop <= 0; stat_rm_drop <= 0;
             case (state)
@@ -136,24 +147,25 @@ module afdx_rx_integrity #(
                 end
                 AGE: begin
                     age_hi <= age_hi_base - {15'd0,age_lo[16]};
+                    age_low_greater <= age_lo[15:0] > SKEW_LIMIT[15:0];
                     rm_seq_ok <= RM_EN == 0 || !rv || (sn_l == 0 && lsn != 0) ||
                                  (distance >= 1 && distance <= 127);
                     state <= CHECK;
                 end
                 CHECK: begin
-                    expired <= {age_hi,age_lo[15:0]} > SKEW_MAX_US;
-                    state <= DECIDE;
-                end
-                DECIDE: begin
-                    decision <= ic_ok && (rm_seq_ok || expired);
+                    // 低半字比较与高半字借位并行；最终只比较 16 位高半字。
+                    // 保持严格 > SkewMax 和 32 位时间回绕语义，省掉独立 DECIDE 拍。
+                    decision <= ic_ok && (rm_seq_ok || age_hi > SKEW_LIMIT[31:16] ||
+                        (age_hi == SKEW_LIMIT[31:16] && age_low_greater));
                     state <= COMMIT;
                 end
                 COMMIT: begin
                     resp <= 1; accept <= decision;
                     stat_ic_drop <= !ic_ok;
                     stat_rm_drop <= ic_ok && !decision;
-                    state <= IDLE;
+                    state <= (DEFER_COMMIT != 0 && decision) ? PENDING : IDLE;
                 end
+                PENDING: if (delivery_done) state <= IDLE;
                 default: state <= IDLE;
             endcase
         end

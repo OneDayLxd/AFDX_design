@@ -206,7 +206,7 @@ module afdx_mgmt_plane #(
             req_release <= 1'b0; ev_take <= 1'b0;
             if (owner == W_NONE) begin
                 // 空闲时各引擎都不会 post（post 总在 done 之前），只需检查发送缓冲忙
-                if (!tb_busy && !req_release) begin
+                if (enable && !tb_busy && !req_release) begin
                     if (req_valid && req_class == 2'd3) begin owner <= W_RTC; own_rtc <= 1'b1; go_rtc <= 1'b1; end
                     else if (req_valid && req_class == 2'd1 && !cfg_busy) begin
                         owner <= W_SNMP; own_snmp <= 1'b1; go_snmp <= 1'b1;

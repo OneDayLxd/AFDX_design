@@ -11,6 +11,7 @@
  *   rd_pop requires rd_pop_ready; the pop takes effect on the next clock and nonempty
  *   (NONEMPTY_RAM=0) falls one clock after that. Hold rd_vl until the pop has taken effect.
  *   pool_used includes retired blocks until reclaim_busy deasserts.
+ *   可选每 256 VL 的占用摘要供交付器跳过空区；只统计已提交消息。
  *
  * Sub Module:
  *   afdx_rr_arbiter
@@ -43,7 +44,8 @@ module afdx_msg_queue #(
     // 1: 大 VL 数时不再生成 N_VL 位 nonempty 寄存器，
     //    改为 16 路 1 位宽 RAM，按 16 个 VL 一组读出（ne_group -> ne_bits，1 拍延迟）。
     //    两种模式复位后都逐项清零状态 RAM，init_busy 期间不接收写入。
-    parameter NONEMPTY_RAM = 0
+    parameter NONEMPTY_RAM = 0,
+    parameter SUMMARY_ENABLE = 0
 ) (
     input wire clk, rst,
     input wire [VLW-1:0] wr_vl,
@@ -72,7 +74,9 @@ module afdx_msg_queue #(
     output reg [POOL_AW+SLOT_AW-BLOCK_AW:0] pool_msgs_peak,
     input wire [(VLW>4 ? VLW-4 : 1)-1:0] ne_group,
     output reg [15:0] ne_bits,
-    output wire init_busy
+    output wire init_busy,
+    output wire [(N_VL+255)/256-1:0] ne_regions,
+    output wire wr_commit_ok
 );
     `include "afdx_math.vh"
     localparam AW = POOL_AW + SLOT_AW;
@@ -290,6 +294,8 @@ module afdx_msg_queue #(
     // address and commit_len, and counters ignore it (warning 17031).
     reg [SLOT_AW:0] wr_count;
     reg commit, cancel;
+    // 与描述符真正入队同拍的确认，供上游事务化 RM 提交使用。
+    assign wr_commit_ok = commit;
     wire wr_index_ok = wr_vl < N_VL;
     wire rd_index_ok = rd_vl < N_VL;
     reg [VLW-1:0] admission_vl;
@@ -404,6 +410,28 @@ module afdx_msg_queue #(
     // State written on this clock by a pop: a pop without a same-VL commit,
     // or a pop deferred behind a commit to another VL.
     wire pop_write = (pop && !same_vl) || pending_pop;
+    // 每 256 VL 统计已提交消息；仅供跳过空区，不替代逐 VL 非空 RAM。
+    // commit/pop 同拍同区相抵，按真正提交/出队计数，abort 不改变摘要。
+    localparam REGION_CW = afdx_clog2(MSGS + 1);
+    genvar region;
+    generate for (region = 0; region < (N_VL+255)/256; region = region + 1) begin : g_region
+        if (SUMMARY_ENABLE != 0) begin : g_enabled
+            reg [REGION_CW-1:0] count;
+            wire put_region = commit && (commit_vl / 256 == region);
+            wire get_region = pop && (rd_vl / 256 == region);
+            always @(posedge clk) begin
+                if (rst) count <= 0;
+                else case ({put_region, get_region})
+                    2'b10: count <= count + 1'b1;
+                    2'b01: count <= count - 1'b1;
+                    default: ;
+                endcase
+            end
+            assign ne_regions[region] = count != 0;
+        end else begin : g_disabled
+            assign ne_regions[region] = 1'b1;
+        end
+    end endgenerate
     wire [VLW-1:0] pop_write_vl = pending_pop ? pending_pop_vl : rd_vl;
     always @(posedge clk) begin
         if (rst) begin

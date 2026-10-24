@@ -4,10 +4,12 @@
  * Module Name  : afdx_mac_tx
  *
  * Function:
- *   MAC 发送：共享小块帧存储、逐 VL FIFO、按实际出口 BAG 的轮询选择。
+ *   MAC 发送：旧模式使用共享小块帧队列，按实际出口 BAG 轮询选择 VL。
  *   BAG 未到期的 VL 不会挡住其它 VL；同 VL 帧顺序保持不变。
- *   队列弹性读口直接驱动数据阶段，连续 tx_slot 时每时钟输出一个字节。
+ *   队列读口或外部模式双槽驱动数据阶段，连续就绪时每时钟输出一个字节。
  *   in_tag 随帧保存；带标记帧的 SOF 同时给出 stat_sof_tag，用于时间同步报文的发送时间戳。
+ *   EXTERNAL_MAC=1 时直接流入核心外 MAC 的整帧 FIFO，不重复缓存帧载荷；
+ *   组帧与线路发送重叠，元数据队列按实际 GMII SOF 更新 BAG；上游按 bag_open 筛选 VL。
  *
  * Sub Module:
  *   afdx_crc32
@@ -26,7 +28,8 @@ module afdx_mac_tx #(
     parameter N_VL = 8,
     parameter VLW = 3,
     parameter CLK_HZ = 100_000_000,
-    parameter STRICT_BAG = 1
+    parameter STRICT_BAG = 1,
+    parameter EXTERNAL_MAC = 0
 ) (
     input wire clk,
     input wire rst,
@@ -47,6 +50,9 @@ module afdx_mac_tx #(
     output reg stat_sof,
     output reg [VLW-1:0] stat_sof_vl,
     output reg stat_sof_tag,
+    output wire       tx_last,
+    input  wire       wire_sof,
+    input  wire       wire_done,
     output wire bag_wait
 );
     `include "afdx_math.vh"
@@ -61,22 +67,21 @@ module afdx_mac_tx #(
     localparam TW = afdx_clog2(128000 * CYCLES_PER_US + 1) + 1;
     localparam S_IDLE = 4'd0, S_DATA = 4'd1, S_FCS = 4'd2, S_IFG = 4'd3,
                S_SETUP = 4'd4, S_POP = 4'd5, S_BAG = 4'd6, S_REFRESH = 4'd7,
-               S_BAG_PREP = 4'd8;
+               S_BAG_PREP = 4'd8, S_WIRE_WAIT = 4'd9;
     reg [3:0] state;
     reg [VLW-1:0] frame_vl, rr_ptr;
     reg [19:0] frame_bag_us;
     reg frame_tag;
     reg first_byte;
-    wire read_start;
     reg frame_due;
     wire data_allowed = !first_byte || frame_due;
     reg [31:0] crc;
     reg [1:0] fcs_idx;
     reg [IFG_W-1:0] ifg_cnt;
-    wire [7:0] q_data;
+    wire [7:0] q_data, stream_data;
+    wire stream_valid, stream_last;
+    wire [VLW-1:0] direct_vl;
     wire q_valid, q_last, q_info_valid, q_pop_ready;
-    // Start the queue read on the edge where the descriptor is valid.
-    assign read_start = (state == S_BAG) && q_info_valid;
     wire [19:0] q_bag_us;
     wire q_tag;
     wire [N_VL-1:0] nonempty;
@@ -84,37 +89,86 @@ module afdx_mac_tx #(
     reg [VLW-1:0] pick;
     wire [N_VL-1:0] ready_requests, prepare_requests;
     wire take = tx_valid && tx_slot;
-    wire data_take = state == S_DATA && data_allowed && q_valid && tx_slot;
+    wire data_take = state == S_DATA && data_allowed && stream_valid && tx_slot;
     wire pop = state == S_POP && q_pop_ready;
     wire start_frame = data_take && first_byte;
     wire [31:0] crc_next;
+    wire [19:0] setup_bag = (EXTERNAL_MAC != 0) ? frame_bag_us : q_bag_us;
     reg [24:0] bag_times24;
+    reg [26:0] bag_times126;
     wire [24:0] bag_times25 = bag_times24 + {5'd0,frame_bag_us};
+    wire [26:0] bag_times125 = bag_times126 - {7'd0,frame_bag_us};
     // At 100 MHz, 100*x = 4*(24*x+x). Capture the first sum alongside
     // the descriptor, leaving only one carry chain in each cycle.
-    always @(posedge clk)
-        bag_times24 <= {1'b0,q_bag_us,4'b0} + {2'b0,q_bag_us,3'b0};
+    always @(posedge clk) begin
+        bag_times24 <= {1'b0,setup_bag,4'b0} + {2'b0,setup_bag,3'b0};
+        // 125*x=(128*x-2*x)-x；配置到计时器之间插寄存器，避免组合乘法路径。
+        bag_times126 <= {setup_bag,7'b0} - {6'b0,setup_bag,1'b0};
+    end
     wire [31:0] bag_cycles_now = (CYCLES_PER_US == 100) ?
-        {5'd0,bag_times25,2'b0} : frame_bag_us * CYCLES_PER_US;
+        {5'd0,bag_times25,2'b0} : (CYCLES_PER_US == 125) ?
+        {5'd0,bag_times125} : frame_bag_us * CYCLES_PER_US;
     wire [7:0] fcs_byte = (fcs_idx == 0) ? ~crc[7:0] :
                           (fcs_idx == 1) ? ~crc[15:8] :
                           (fcs_idx == 2) ? ~crc[23:16] : ~crc[31:24];
-    assign tx_data = (state == S_FCS) ? fcs_byte : q_data;
-    assign tx_valid = (state == S_DATA && data_allowed && q_valid) || state == S_FCS;
+    assign tx_last = (state == S_DATA) && data_allowed && stream_valid && stream_last;
+    assign tx_data = (state == S_FCS) ? fcs_byte : stream_data;
+    assign tx_valid = (state == S_DATA && data_allowed && stream_valid) || state == S_FCS;
     assign tx_frame = (state == S_DATA && data_allowed) || state == S_FCS;
-    assign tx_busy = state != S_IDLE;
+    // 最多四槽 MAC 帧缓存再加一帧在写；八项仅存元数据，不复制载荷。
+    localparam META_LOG = 3;
+    localparam META_W = VLW + TW + 1;
+    (* mem2reg *) reg [META_W-1:0] meta_mem [0:(1<<META_LOG)-1];
+    reg [META_LOG-1:0] meta_wp, meta_rp;
+    reg [META_LOG:0] meta_count;
+    reg wire_active;
+    assign tx_busy = state != S_IDLE || ((EXTERNAL_MAC != 0) && (meta_count != 0 || wire_active));
+    wire meta_put = (EXTERNAL_MAC != 0) && start_frame;
+    wire meta_get = (EXTERNAL_MAC != 0) && wire_sof;
+    wire [VLW-1:0] meta_vl;
+    wire [TW-1:0] meta_bag;
+    wire meta_tag;
+    assign {meta_vl,meta_bag,meta_tag} = meta_mem[meta_rp];
+    reg [VLW-1:0] feedback_vl;
+    reg [15:0] feedback_lane_oh;
+    reg [N_VL-1:0] queued_vls;
+    // SOF 到来时使用队首元数据，不能使用正在组装的下一帧的配置。
+    always @(posedge clk) begin
+        if (rst) begin meta_wp <= 0; meta_rp <= 0; meta_count <= 0; wire_active <= 0; end
+        else begin
+            if (wire_done) wire_active <= 1'b0;
+            if (meta_get) wire_active <= 1'b1;
+            case ({meta_put,meta_get})
+                2'b10: meta_count <= meta_count + 1'b1;
+                2'b01: meta_count <= meta_count - 1'b1;
+                default: ;
+            endcase
+            if (meta_put) begin
+                meta_mem[meta_wp] <= {frame_vl,bag_cycles_now[TW-1:0],frame_tag};
+                meta_wp <= meta_wp + 1'b1;
+            end
+            if (meta_get) meta_rp <= meta_rp + 1'b1;
+        end
+        if (meta_get) begin
+            feedback_vl <= meta_vl;
+            feedback_lane_oh <= 16'd1 << (meta_vl % 16);
+        end
+    end
     // Registered SOF report; the redundancy credit clears one clock later.
     always @(posedge clk) begin
         if (rst) begin stat_sof <= 1'b0; stat_sof_tag <= 1'b0; end
-        else begin stat_sof <= start_frame; stat_sof_tag <= start_frame && frame_tag; end
-        stat_sof_vl <= frame_vl;
+        else begin
+            stat_sof <= (EXTERNAL_MAC != 0) ? wire_sof : start_frame;
+            stat_sof_tag <= (EXTERNAL_MAC != 0) ? (wire_sof && meta_tag) : (start_frame && frame_tag);
+        end
+        stat_sof_vl <= (EXTERNAL_MAC != 0) ? meta_vl : frame_vl;
     end
     // 此信号表示已有完整帧，但所有候选 VL 均在等待 BAG。
     assign bag_wait = (state == S_IDLE && (|nonempty) && !(|ready_requests) && !(|prepare_requests)) ||
                       (state == S_DATA && first_byte && !frame_due);
     afdx_crc32 u_crc (
         .crc_in  (crc),
-        .data    (q_data),
+        .data    (stream_data),
         .crc_out (crc_next)
     );
 
@@ -134,23 +188,13 @@ module afdx_mac_tx #(
     reg input_valid, input_spare;
     wire queue_ready;
     wire input_put = in_valid && in_ready;
-    reg queue_valid;
-    (* preserve *) reg [IW-1:0] queue_entry;
-    wire queue_stage_ready = !queue_valid || queue_ready;
-    wire input_get = input_valid && queue_stage_ready;
-    wire [VLW-1:0] queue_vl;
-    wire [19:0] queue_bag;
-    wire queue_last, queue_tag;
-    wire [7:0] queue_data;
+    wire queue_stage_ready;
+    wire input_get = (EXTERNAL_MAC != 0) ? data_take : input_valid && queue_stage_ready;
     wire [IW-1:0] input_head = input_hsel ? input_e1 : input_e0;
-    assign {queue_vl,queue_tag,queue_bag,queue_last,queue_data} = queue_entry;
-    // End the circular-buffer mux at a local elastic stage before queue
-    // admission/commit logic. Hold the last entry while invalid for prefetch.
-    always @(posedge clk) begin
-        if (rst) queue_valid <= 1'b0;
-        else if (queue_stage_ready) queue_valid <= input_valid;
-        if (queue_stage_ready && input_valid) queue_entry <= input_head;
-    end
+    assign direct_vl = input_head[IW-1:30];
+    assign stream_data = (EXTERNAL_MAC != 0) ? input_head[7:0] : q_data;
+    assign stream_valid = (EXTERNAL_MAC != 0) ? input_valid : q_valid;
+    assign stream_last = (EXTERNAL_MAC != 0) ? input_head[8] : q_last;
     assign in_ready = !input_spare;
     always @(posedge clk) begin
         // in_valid includes upstream A/B ready logic. Keep that round trip
@@ -180,48 +224,80 @@ module afdx_mac_tx #(
         end
     end
 
-    afdx_msg_queue #(
-        .N_VL     (N_VL),
-        .VLW      (VLW),
-        .DEPTH    (1 << BLOCK_LOG),
-        .DW       (DESC_LOG),
-        .SLOT_AW  (SLOT_AW),
-        .MW       (21),
-        .POOL_AW  (FIFO_AW-SLOT_AW),
-        .BLOCK_AW (BLOCK_AW)
-    ) u_frames (
-        .clk            (clk),
-        .rst            (rst),
-        .wr_vl          (queue_vl),
-        .wr_vl_same     (1'b1),
-        .wr_valid       (queue_valid),
-        .wr_data        (queue_data),
-        .wr_ready       (queue_ready),
-        .wr_commit      (queue_valid && queue_last),
-        .wr_meta        ({queue_tag,queue_bag}),
-        .wr_abort       (1'b0),
-        .wr_ovf         (),
-        .rd_vl          (frame_vl),
-        .rd_start       (read_start),
-        .rd_info_valid  (q_info_valid),
-        .rd_pop_ready   (q_pop_ready),
-        .reclaim_busy   (),
-        .rd_pop         (pop),
-        .rd_len         (),
-        .rd_meta        ({q_tag,q_bag_us}),
-        .rd_data        (q_data),
-        .rd_valid       (q_valid),
-        .rd_last        (q_last),
-        .rd_ready       (state == S_DATA && data_allowed && tx_slot),
-        .nonempty       (nonempty),
-        .pool_used      (),
-        .pool_peak      (),
-        .pool_msgs      (),
-        .pool_msgs_peak (),
-        .ne_group       ({(VLW>4 ? VLW-4 : 1){1'b0}}),
-        .ne_bits        (),
-        .init_busy      ()
-    );
+    generate if (EXTERNAL_MAC == 0) begin : g_queued_tx
+        // 旧字节总线模式的队列前级；生产模式直接流向 GMII 适配器。
+        reg queue_valid;
+        (* preserve *) reg [IW-1:0] queue_entry;
+        wire [VLW-1:0] queue_vl;
+        wire [19:0] queue_bag;
+        wire queue_last, queue_tag;
+        wire [7:0] queue_data;
+        wire read_start = (state == S_BAG) && q_info_valid;
+        assign queue_stage_ready = !queue_valid || queue_ready;
+        assign {queue_vl,queue_tag,queue_bag,queue_last,queue_data} = queue_entry;
+        // 保持空闲时的最后一个队列入口，供同步 RAM 预取。
+        always @(posedge clk) begin
+            if (rst) queue_valid <= 1'b0;
+            else if (queue_stage_ready) queue_valid <= input_valid;
+            if (queue_stage_ready && input_valid) queue_entry <= input_head;
+        end
+        afdx_msg_queue #(
+            .N_VL     (N_VL),
+            .VLW      (VLW),
+            .DEPTH    (1 << BLOCK_LOG),
+            .DW       (DESC_LOG),
+            .SLOT_AW  (SLOT_AW),
+            .MW       (21),
+            .POOL_AW  (FIFO_AW-SLOT_AW),
+            .BLOCK_AW (BLOCK_AW)
+        ) u_frames (
+            .clk            (clk),
+            .rst            (rst),
+            .wr_vl          (queue_vl),
+            .wr_vl_same     (1'b1),
+            .wr_valid       (queue_valid),
+            .wr_data        (queue_data),
+            .wr_ready       (queue_ready),
+            .wr_commit      (queue_valid && queue_last),
+            .wr_meta        ({queue_tag,queue_bag}),
+            .wr_abort       (1'b0),
+            .wr_ovf         (),
+            .wr_commit_ok   (),
+            .rd_vl          (frame_vl),
+            .rd_start       (read_start),
+            .rd_info_valid  (q_info_valid),
+            .rd_pop_ready   (q_pop_ready),
+            .reclaim_busy   (),
+            .rd_pop         (pop),
+            .rd_len         (),
+            .rd_meta        ({q_tag,q_bag_us}),
+            .rd_data        (q_data),
+            .rd_valid       (q_valid),
+            .rd_last        (q_last),
+            .rd_ready       (state == S_DATA && data_allowed && tx_slot),
+            .nonempty       (nonempty),
+            .pool_used      (),
+            .pool_peak      (),
+            .pool_msgs      (),
+            .pool_msgs_peak (),
+            .ne_group       ({(VLW>4 ? VLW-4 : 1){1'b0}}),
+            .ne_bits        (),
+            .init_busy      (),
+            .ne_regions     ()
+        );
+    end else begin : g_direct_tx
+        // 输入双槽只隔离 ready 路径，整帧存储由下游 MAC 路径承担。
+        assign queue_stage_ready = 1'b0;
+        assign queue_ready = 1'b0;
+        assign q_data = 8'd0;
+        assign q_valid = 1'b0;
+        assign q_last = 1'b0;
+        assign q_info_valid = 1'b0;
+        assign q_pop_ready = 1'b0;
+        assign q_bag_us = 20'd0;
+        assign q_tag = 1'b0;
+        assign nonempty = {N_VL{1'b0}};
+    end endgenerate
 
     // BAG state. Each 16-VL region keeps its VL deadlines in a small RAM and
     // compares one of them per clock with its local clock count, so a VL is
@@ -252,7 +328,11 @@ module afdx_mac_tx #(
         else if (state == S_BAG && q_info_valid)
             deadline_base <= cycle_count + bag_cycles_now[TW-1:0];
         else if (deadline_step) deadline_base <= deadline_base_plus1;
-        if (deadline_step) begin
+        if (EXTERNAL_MAC != 0 && wire_sof) begin
+            // Feedback arrives after GMII SOF: the resulting BAG is conservative.
+            deadline_q <= cycle_count + meta_bag;
+            deadline_m1 <= cycle_count + meta_bag - 1'b1;
+        end else if (deadline_step && EXTERNAL_MAC == 0) begin
             deadline_q <= deadline_base_plus1;
             deadline_m1 <= deadline_base;
         end
@@ -455,15 +535,16 @@ module afdx_mac_tx #(
         always @(posedge clk) pick_group_oh[grp] <= group_b2 == GROUP_ID;
     end endgenerate
 
-    // SOF (stat_sof, one clock after the first byte) is registered once per
-    // 16-VL region before it updates BAG state; frame_vl, frame_lane_oh and
-    // the captured deadline are stable until the next frame is selected.
+    // SOF is registered once per 16-VL region before it updates BAG state.
+    // 外部模式使用已弹出元数据的 feedback_vl/lane，不受下一帧组装影响。
     (* preserve *) reg [GROUPS-1:0] rst_group, sof_group;
+    wire [VLW-1:0] bag_vl = (EXTERNAL_MAC != 0) ? feedback_vl : frame_vl;
+    wire [15:0] bag_lane_oh = (EXTERNAL_MAC != 0) ? feedback_lane_oh : frame_lane_oh;
     wire [3:0] frame_lane;
     generate if (VLW >= 4) begin : g_frame_lane_wide
-        assign frame_lane = frame_vl[3:0];
+        assign frame_lane = bag_vl[3:0];
     end else begin : g_frame_lane_narrow
-        assign frame_lane = {{(4-VLW){1'b0}}, frame_vl};
+        assign frame_lane = {{(4-VLW){1'b0}}, bag_vl};
     end endgenerate
     genvar cg, fl;
     generate for (cg = 0; cg < GROUPS; cg = cg + 1) begin : g_deadline_region
@@ -484,7 +565,8 @@ module afdx_mac_tx #(
         always @(posedge clk) begin
             rst_group[cg] <= rst;
             if (rst) sof_group[cg] <= 1'b0;
-            else sof_group[cg] <= stat_sof && frame_group_oh[cg];
+            else sof_group[cg] <= stat_sof && ((EXTERNAL_MAC != 0) ?
+                                             (feedback_vl / 16 == cg) : frame_group_oh[cg]);
             if (rst) begin
                 cycle_count_group[cg] <= PHASE;
                 prep_count_group[cg] <= PHASE + PREP_AHEAD;
@@ -519,12 +601,22 @@ module afdx_mac_tx #(
         // whose flags already hold the reset values.
         for (fl = 0; fl < 16; fl = fl + 1) begin : g_lane_flags
             if (cg*16 + fl < N_VL) begin : g_real
+                // 相同 VL 在首次线路 SOF 反馈前不得再次抢占 MAC FIFO。
+                // 与 bag_active 同拍释放，避免信用先释放而 BAG 尚未关闭的空隙。
+                always @(posedge clk) begin
+                    if (rst_group[cg] || EXTERNAL_MAC == 0) queued_vls[cg*16 + fl] <= 1'b0;
+                    else begin
+                        if (sof_group[cg] && bag_lane_oh[fl]) queued_vls[cg*16 + fl] <= 1'b0;
+                        if (meta_put && frame_group_oh[cg] && frame_lane_oh[fl])
+                            queued_vls[cg*16 + fl] <= 1'b1;
+                    end
+                end
                 always @(posedge clk) begin
                     if (rst_group[cg]) begin
                         bag_active[cg*16 + fl] <= 1'b0;
                         prepare_open[cg*16 + fl] <= 1'b1;
                     end else if (STRICT_BAG != 0) begin
-                        if (sof_group[cg] && frame_lane_oh[fl]) begin
+                        if (sof_group[cg] && bag_lane_oh[fl]) begin
                             bag_active[cg*16 + fl] <= 1'b1;
                             prepare_open[cg*16 + fl] <= 1'b0;
                         end else if (scan_hit[fl]) begin
@@ -547,10 +639,10 @@ module afdx_mac_tx #(
     (* ramstyle = "M4K, no_rw_check" *) reg [TW-1:0] frame_deadline_mem [0:N_VL-1];
     reg [TW-1:0] frame_deadline_read, frame_deadline_m1;
     reg frame_ready_class;
-    wire [VLW-1:0] frame_deadline_addr = (state == S_IDLE) ? pick : frame_vl;
+    wire [VLW-1:0] frame_deadline_addr = (state == S_IDLE) ? ((EXTERNAL_MAC != 0) ? direct_vl : pick) : frame_vl;
     wire [TW-1:0] frame_elapsed = cycle_count - frame_deadline_m1;
     always @(posedge clk) begin
-        if (stat_sof) frame_deadline_mem[frame_vl] <= deadline_m1;
+        if (stat_sof) frame_deadline_mem[bag_vl] <= deadline_m1;
         frame_deadline_read <= frame_deadline_mem[frame_deadline_addr];
     end
     always @(posedge clk) begin
@@ -572,11 +664,21 @@ module afdx_mac_tx #(
             first_byte <= 0; frame_ready_class <= 0;
             fcs_idx <= 0; ifg_cnt <= 0; stat_frame <= 0;
         end else begin
-            stat_frame <= 0;
+            stat_frame <= (EXTERNAL_MAC != 0) && wire_done;
             case (state)
-                // A ready VL appearing in the newer group snapshot takes
-                // priority over a still-pipelined preparation-only choice.
-                S_IDLE: if (found && (!ready_any_q || selected_ready)) begin
+                // 旧模式使用新鲜的仲裁快照；外部模式锁存已接受首拍的元数据。
+                S_IDLE: if (EXTERNAL_MAC != 0) begin
+                    if (input_valid && meta_count < (1<<META_LOG) && !queued_vls[direct_vl]) begin
+                        frame_vl <= direct_vl;
+                        frame_group_oh <= {{(GROUPS-1){1'b0}},1'b1} << (direct_vl / 16);
+                        frame_lane_oh <= 16'd1 << (direct_vl % 16);
+                        frame_ready_class <= bag_open[direct_vl];
+                        frame_bag_us <= input_head[28:9];
+                        frame_tag <= input_head[29];
+                        first_byte <= 1'b1;
+                        state <= S_SETUP;
+                    end
+                end else if (found && (!ready_any_q || selected_ready)) begin
                     frame_vl <= pick;
                     frame_group_oh <= pick_group_oh;
                     frame_lane_oh <= pick_lane_oh;
@@ -584,23 +686,31 @@ module afdx_mac_tx #(
                     first_byte <= 1;
                     state <= S_SETUP;
                 end
-                S_SETUP: if (q_info_valid) begin
+                S_SETUP: if (EXTERNAL_MAC != 0) begin
+                    state <= S_BAG;
+                end else if (q_info_valid) begin
                     frame_bag_us <= q_bag_us;
                     frame_tag <= q_tag;
                     state <= S_BAG;
                 end
-                S_BAG: if (q_info_valid) begin
+                S_BAG: if (EXTERNAL_MAC != 0 || q_info_valid) begin
                     state <= S_BAG_PREP;
                 end
                 S_BAG_PREP: state <= S_DATA;
                 S_DATA: begin
                     if (data_take) begin
                         first_byte <= 0;
-                        if (q_last) begin
+                        if (stream_last) begin
                             fcs_idx <= 0;
-                            state <= S_FCS;
+                            state <= (EXTERNAL_MAC != 0) ? S_REFRESH : S_FCS;
                         end
                     end
+                end
+                // 兼容保留状态编码；外部模式已由元数据队列接收异步线路反馈。
+                S_WIRE_WAIT: if (wire_done) begin
+                    stat_frame <= 1;
+                    rr_ptr <= (frame_vl == N_VL-1) ? {VLW{1'b0}} : frame_vl + 1'b1;
+                    state <= S_REFRESH;
                 end
                 S_FCS: if (take) begin
                     fcs_idx <= fcs_idx + 1'b1;
@@ -611,7 +721,7 @@ module afdx_mac_tx #(
                         state <= S_POP;
                     end
                 end
-                S_POP: if (q_pop_ready) state <= S_IFG;
+                S_POP: if (q_pop_ready) state <= (EXTERNAL_MAC != 0) ? S_REFRESH : S_IFG;
                 S_IFG: if (tx_slot) begin
                     ifg_cnt <= ifg_cnt + 1'b1;
                     if (ifg_cnt == IFG-1) state <= S_REFRESH;

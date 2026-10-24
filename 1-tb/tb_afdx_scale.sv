@@ -2,6 +2,9 @@
 `timescale 1ns/1ps
 `include "afdx_cfg_params.vh"
 module tb_afdx_scale;
+    // 批处理统一检查完成标志，避免提前 $fatal 被误判为成功。
+    integer tb_errors = 0;
+    bit tb_done = 0;
     `include "tb_scale_common.svh"
     localparam NT = `AFDX_N_TX_VL, TW = `AFDX_TX_VLW;
     localparam NR = `AFDX_N_RX_VL, RW = `AFDX_RX_VLW;
@@ -29,6 +32,28 @@ module tb_afdx_scale;
     wire [8:0] tx_used, rx_used, tx_peak, rx_peak, tx_msgs_peak, rx_msgs_peak;
     localparam TX_VLW_TIE = TW;
     afdx_es_core #(.N_TX_VL(NT), .TX_VLW(TW), .N_RX_VL(NR), .RX_VLW(RW)) dut (
+        .cnt_rx_mac_error          (),
+        .mgmt_window               (),
+        .mac_a_tx_last             (),
+        .mac_a_wire_sof            (1'b0),
+        .mac_a_wire_done           (1'b0),
+        .mac_a_rx_last             (1'b0),
+        .mac_a_rx_ready            (),
+        .mac_a_rx_ts               (32'd0),
+        .mac_a_rx_good_count       (32'd0),
+        .mac_a_rx_error_count      (32'd0),
+        .mac_a_rx_length_count     (32'd0),
+        .mac_a_rx_overflow_count   (32'd0),
+        .mac_b_tx_last             (),
+        .mac_b_wire_sof            (1'b0),
+        .mac_b_wire_done           (1'b0),
+        .mac_b_rx_last             (1'b0),
+        .mac_b_rx_ready            (),
+        .mac_b_rx_ts               (32'd0),
+        .mac_b_rx_good_count       (32'd0),
+        .mac_b_rx_error_count      (32'd0),
+        .mac_b_rx_length_count     (32'd0),
+        .mac_b_rx_overflow_count   (32'd0),
         .clk(clk), .rst(rst), .tx_msg_vl(tx_msg_vl), .tx_msg_valid(tx_msg_valid), .tx_msg_data(tx_msg_data),
         .tx_msg_last(tx_msg_last), .tx_msg_ready(tx_msg_ready),
         .rx_msg_vl(rx_msg_vl), .rx_msg_valid(rx_msg_valid), .rx_msg_data(rx_msg_data),
@@ -173,6 +198,8 @@ module tb_afdx_scale;
         $display("METRIC scaled_tx_pool_peak_messages=%0d", tx_msgs_peak);
         $display("METRIC scaled_rx_pool_peak_messages=%0d", rx_msgs_peak);
         $display("METRIC scaled_bag_violations=%0d", bag_errors);
+        tb_errors = tb_err_cnt;
+        tb_done = (tb_err_cnt == 0);
         $display("tb_afdx_scale: %0d checks, %0d errors -> %s", tb_chk_cnt, tb_err_cnt, tb_err_cnt == 0 ? "PASS" : "FAIL");
         if (tb_err_cnt) $fatal(1, "scale regression failed");
         $finish;

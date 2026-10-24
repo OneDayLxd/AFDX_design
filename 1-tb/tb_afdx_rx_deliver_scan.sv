@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
 module tb_afdx_rx_deliver_scan;
+    // 批处理统一检查完成标志，避免提前 $fatal 被误判为成功。
+    integer tb_errors = 0;
+    bit tb_done = 0;
     reg clk = 0;
     always #5 clk = ~clk;
     reg rst = 1;
@@ -17,15 +20,20 @@ module tb_afdx_rx_deliver_scan;
     integer checks = 0;
     integer cycle = 0;
     integer i;
+    wire [15:0] ne_regions;
+    genvar region;
+    generate for (region=0; region<16; region=region+1) begin : g_summary
+        assign ne_regions[region] = |nonempty[region*256 +: 256];
+    end endgenerate
 
-    afdx_rx_deliver #(.N_VL(4096), .VLW(12)) dut (
+    afdx_rx_deliver #(.N_VL(4096), .VLW(12), .SUMMARY_ENABLE(1)) dut (
         .clk(clk), .rst(rst), .nonempty(nonempty), .ne_group(), .ne_bits(16'd0), .q_init_busy(1'b0),
         .q_rd_vl(q_rd_vl), .q_rd_start(q_rd_start), .q_rd_pop(q_rd_pop),
         .q_rd_info_valid(1'b1), .q_rd_pop_ready(1'b1),
         .q_rd_len(11'd1), .q_rd_meta(9'h055),
         .q_rd_data(8'ha5), .q_rd_valid(1'b1), .q_rd_last(1'b1), .q_rd_ready(q_rd_ready),
         .msg_vl(msg_vl), .msg_valid(msg_valid), .msg_data(msg_data), .msg_last(msg_last),
-        .msg_ready(1'b1), .msg_len(msg_len), .msg_meta(msg_meta), .stat_deliver(stat_deliver));
+        .msg_ready(1'b1), .msg_len(msg_len), .msg_meta(msg_meta), .stat_deliver(stat_deliver), .ne_regions(ne_regions));
 
     always @(posedge clk) begin
         cycle = cycle + 1;
@@ -85,9 +93,10 @@ module tb_afdx_rx_deliver_scan;
 
         high_start = cycle;
         enqueue(4095,1);
-        wait_deliveries(10, 270);
-        if (cycle - high_start > 265) $fatal(1, "high VL scan took %0d cycles", cycle - high_start);
+        wait_deliveries(10, 70);
+        if (cycle - high_start > 65) $fatal(1, "high VL scan took %0d cycles", cycle - high_start);
         checks = checks + 3;
+        tb_done = 1;
         $display("tb_afdx_rx_deliver_scan: %0d checks, 0 errors -> PASS", checks);
         $finish;
     end

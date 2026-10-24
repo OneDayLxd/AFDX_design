@@ -28,6 +28,9 @@ module tb_afdx_mac_tx_bag;
     reg tx_slot = 1'b1;
 
     afdx_mac_tx #(.FIFO_AW(12), .IFG(12), .N_VL(N_VL), .VLW(VLW), .CLK_HZ(CLK_HZ)) dut (
+        .tx_last                   (),
+        .wire_sof                  (1'b0),
+        .wire_done                 (1'b0),
         .clk(clk), .rst(rst), .in_data(in_data), .in_valid(in_valid), .in_last(in_last),
         .in_vl(in_vl), .in_bag_us(in_bag_us), .in_tag(1'b0), .in_ready(in_ready),
         .tx_data(tx_data), .tx_valid(tx_valid), .tx_slot(tx_slot), .tx_frame(tx_frame),

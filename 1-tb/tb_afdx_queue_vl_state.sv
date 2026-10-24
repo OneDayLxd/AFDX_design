@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
 module tb_afdx_queue_vl_state;
+    // 批处理统一检查完成标志，避免提前 $fatal 被误判为成功。
+    integer tb_errors = 0;
+    bit tb_done = 0;
     reg clk = 0;
     always #5 clk = ~clk;
     reg rst = 1;
@@ -29,7 +32,8 @@ module tb_afdx_queue_vl_state;
         .rd_valid(rd_valid), .rd_last(rd_last), .rd_ready(rd_ready),
         .nonempty(nonempty), .pool_used(pool_used), .pool_peak(pool_peak),
         .pool_msgs(pool_msgs), .pool_msgs_peak(pool_msgs_peak),
-        .ne_group(8'd0), .ne_bits(), .init_busy(init_busy));
+        .ne_group(8'd0), .ne_bits(), .init_busy(init_busy),
+        .wr_commit_ok ());
 
     task automatic push(input integer vl, input [7:0] data);
         integer timeout;
@@ -181,6 +185,7 @@ module tb_afdx_queue_vl_state;
         if (nonempty[4095] !== 1'b0 || pool_used !== 0 || pool_msgs !== 0)
             $fatal(1, "pool or VL state did not drain");
         checks = checks + 2;
+        tb_done = 1;
         $display("tb_afdx_queue_vl_state: %0d checks, 0 errors -> PASS", checks);
         $finish;
     end

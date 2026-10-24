@@ -1,4 +1,4 @@
-// 实时性能测量：生产参数的 AFDX_top 经存储转发交换机模型自发自收，逐消息记录时间戳。
+// 历史单总线性能基线：专用低带宽配置的 afdx_system 经存储转发交换机模型自发自收，逐消息记录时间戳。
 // 交换机模型：业务 VL 帧完整接收后按 FIFO 顺序以 100 Mbps（每 8 拍 1 字节、帧间 12 字节）送回 rx 口；
 // 管理 VL（VLID MGMT_VLID）帧由管理站模型消费，不回环。
 // 管理站（+MGMT_LOAD=1）：循环以 TFTP RRQ 读取配置对象并逐块 ACK（持续产生 516 字节 DATA 帧），
@@ -8,10 +8,13 @@
 //   S vl seq net t_ns len    业务帧在总线上的 SOF
 //   M t_ns len dport         管理帧 SOF
 //   D vl seq t_ns            接收应用最后一字节握手
-// 统计与判定由 scripts/run_latency.py 完成；本平台只检查数据面错误计数和交换机缓冲。
+// latency.csv 仅记录原始数据；本平台只检查数据面错误计数和交换机缓冲。
 `timescale 1ns/1ps
 `include "afdx_cfg_params.vh"
 module tb_afdx_latency;
+    // 批处理统一检查完成标志，避免提前 $fatal 被误判为成功。
+    integer tb_errors = 0;
+    bit tb_done = 0;
     `include "tb_scale_common.svh"
     localparam [15:0] MGMT_VLID = 16'h1000;
     localparam RING = 1 << 20;
@@ -25,7 +28,55 @@ module tb_afdx_latency;
     reg [7:0] rx_data = 8'h00;
     reg rx_valid = 1'b0, rx_envelope = 1'b0;
 
-    AFDX_top dut (
+    afdx_system dut (
+        .host_tx_vl                ('0),
+        .host_tx_valid             (1'b0),
+        .host_tx_data              ('0),
+        .host_tx_last              (1'b0),
+        .host_tx_ready             (),
+        .host_rx_vl                (),
+        .host_rx_valid             (),
+        .host_rx_data              (),
+        .host_rx_last              (),
+        .host_rx_ready             (1'b0),
+        .host_rx_len               (),
+        .host_rx_sn                (),
+        .host_rx_net               (),
+        .host_rx_ts                (),
+        .host_rx_src_ip            (),
+        .host_rx_sport             (),
+        .host_rx_dport             (),
+        .ext_ts_us                 (),
+        .ext_a_tx_data             (),
+        .ext_a_tx_valid            (),
+        .ext_a_tx_last             (),
+        .ext_a_rx_ready            (),
+        .ext_a_tx_ready            (1'b0),
+        .ext_a_wire_sof            (1'b0),
+        .ext_a_wire_done           (1'b0),
+        .ext_a_rx_valid            (1'b0),
+        .ext_a_rx_last             (1'b0),
+        .ext_a_rx_data             (8'd0),
+        .ext_a_rx_ts               (32'd0),
+        .ext_a_rx_good_count       (32'd0),
+        .ext_a_rx_error_count      (32'd0),
+        .ext_a_rx_length_count     (32'd0),
+        .ext_a_rx_overflow_count   (32'd0),
+        .ext_b_tx_data             (),
+        .ext_b_tx_valid            (),
+        .ext_b_tx_last             (),
+        .ext_b_rx_ready            (),
+        .ext_b_tx_ready            (1'b0),
+        .ext_b_wire_sof            (1'b0),
+        .ext_b_wire_done           (1'b0),
+        .ext_b_rx_valid            (1'b0),
+        .ext_b_rx_last             (1'b0),
+        .ext_b_rx_data             (8'd0),
+        .ext_b_rx_ts               (32'd0),
+        .ext_b_rx_good_count       (32'd0),
+        .ext_b_rx_error_count      (32'd0),
+        .ext_b_rx_length_count     (32'd0),
+        .ext_b_rx_overflow_count   (32'd0),
         .clk(clk), .reset(reset), .tx_data(tx_data), .rx_data(rx_data),
         .tx_valid(tx_valid), .rx_valid(rx_valid), .tx_ready(tx_envelope), .rx_ready(rx_envelope)
     );
@@ -237,6 +288,8 @@ module tb_afdx_latency;
                  dut.cnt_rx_mac_ovf == 0, "no receive errors or drops");
         tb_check(dut.cnt_tx_ovf_drop == 0, "no transmit overflow drops");
         tb_check(!mgmt_load || (tftp_blocks > 0 && snmp_rsp > 0), "management load is served");
+        tb_errors = tb_err_cnt;
+        tb_done = (tb_err_cnt == 0);
         $display("tb_afdx_latency: %0d checks, %0d errors -> %s", tb_chk_cnt, tb_err_cnt, tb_err_cnt == 0 ? "PASS" : "FAIL");
         if (tb_err_cnt) $fatal(1, "latency measurement failed");
         $finish;

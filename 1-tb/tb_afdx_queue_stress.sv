@@ -45,7 +45,8 @@ module tb_afdx_queue_stress;
         .rd_len(rd_len), .rd_meta(rd_meta), .rd_data(rd_data), .rd_valid(rd_valid),
         .rd_last(rd_last), .rd_ready(rd_ready), .nonempty(nonempty), .pool_used(pool_used),
         .pool_peak(pool_peak), .pool_msgs(pool_msgs), .pool_msgs_peak(pool_msgs_peak),
-        .ne_group(ne_group), .ne_bits(ne_bits), .init_busy(init_busy));
+        .ne_group(ne_group), .ne_bits(ne_bits), .init_busy(init_busy),
+        .wr_commit_ok ());
 
     // ---------------- model ----------------
     localparam QMAX = 64;

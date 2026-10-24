@@ -36,11 +36,12 @@ module tb_afdx_rx_ne_ram;
     wire [NE_GW-1:0] ne_group;
     wire [15:0] ne_bits;
     wire init_busy;
+    wire [(N_VL+255)/256-1:0] ne_regions;
     wire [8:0] pool_used, pool_peak, pool_msgs, pool_msgs_peak;
     reg msg_ready = 0;
 
     afdx_msg_queue #(.N_VL(N_VL), .VLW(VLW), .DEPTH(4), .DW(2), .SLOT_AW(11), .MW(9),
-                     .POOL_AW(5), .BLOCK_AW(8), .NONEMPTY_RAM(`NE_MODE)) q (
+                     .POOL_AW(5), .BLOCK_AW(8), .NONEMPTY_RAM(`NE_MODE), .SUMMARY_ENABLE(1)) q (
         .clk(clk), .rst(rst), .wr_vl(wr_vl), .wr_valid(wr_valid), .wr_data(wr_data),
         .wr_ready(wr_ready), .wr_commit(wr_commit), .wr_meta(wr_meta),
         .wr_abort(1'b0), .wr_ovf(wr_ovf),
@@ -50,8 +51,9 @@ module tb_afdx_rx_ne_ram;
         .rd_valid(q_rd_valid), .rd_last(q_rd_last), .rd_ready(q_rd_ready),
         .nonempty(nonempty), .pool_used(pool_used), .pool_peak(pool_peak),
         .pool_msgs(pool_msgs), .pool_msgs_peak(pool_msgs_peak),
-        .ne_group(ne_group), .ne_bits(ne_bits), .init_busy(init_busy));
-    afdx_rx_deliver #(.N_VL(N_VL), .VLW(VLW), .SLOT_AW(11), .MW(9), .NONEMPTY_RAM(`NE_MODE)) d (
+        .ne_group(ne_group), .ne_bits(ne_bits), .init_busy(init_busy), .ne_regions(ne_regions),
+        .wr_commit_ok ());
+    afdx_rx_deliver #(.N_VL(N_VL), .VLW(VLW), .SLOT_AW(11), .MW(9), .NONEMPTY_RAM(`NE_MODE), .SUMMARY_ENABLE(1)) d (
         .clk(clk), .rst(rst), .nonempty(nonempty),
         .ne_group(ne_group), .ne_bits(ne_bits), .q_init_busy(init_busy),
         .q_rd_vl(q_rd_vl), .q_rd_start(q_rd_start), .q_rd_pop(q_rd_pop),
@@ -59,13 +61,32 @@ module tb_afdx_rx_ne_ram;
         .q_rd_meta(q_rd_meta), .q_rd_data(q_rd_data), .q_rd_valid(q_rd_valid), .q_rd_last(q_rd_last),
         .q_rd_ready(q_rd_ready), .msg_vl(msg_vl), .msg_valid(msg_valid), .msg_data(msg_data),
         .msg_last(msg_last), .msg_ready(msg_ready), .msg_len(msg_len), .msg_meta(msg_meta),
-        .stat_deliver(stat_deliver));
+        .stat_deliver(stat_deliver), .ne_regions(ne_regions));
 
     // 消息内容 = {序号, 长度} 编码：首字节为该 VL 的发送序号，其余字节 = 序号+位置。
     integer sent_seq [0:N_VL-1];
     integer recv_seq [0:N_VL-1];
     integer sent = 0, received = 0, byte_pos = 0, errors_seen = 0;
     integer i, seed = 7;
+    integer region_model [0:(N_VL+255)/256-1];
+    integer region_index;
+    always @(posedge clk) begin
+        if (rst) begin
+            for (region_index=0; region_index<(N_VL+255)/256; region_index=region_index+1)
+                region_model[region_index] = 0;
+        end else begin
+            if (q.commit) region_model[q.commit_vl/256] = region_model[q.commit_vl/256] + 1;
+            if (q.pop) region_model[q_rd_vl/256] = region_model[q_rd_vl/256] - 1;
+        end
+    end
+    always @(negedge clk) begin
+        if (!rst) begin
+            for (region_index=0; region_index<(N_VL+255)/256; region_index=region_index+1)
+                if (region_model[region_index] < 0 ||
+                    ne_regions[region_index] !== (region_model[region_index] != 0))
+                    $fatal(1, "region occupancy mismatch region=%0d count=%0d", region_index, region_model[region_index]);
+        end
+    end
 
     task automatic send_msg(input integer vl, input integer len);
         integer k, timeout;

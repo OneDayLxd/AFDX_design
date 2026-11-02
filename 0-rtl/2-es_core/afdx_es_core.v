@@ -33,6 +33,8 @@
 
 `timescale 1ns/1ps
 module afdx_es_core #(
+    parameter FRAGMENT_ENABLE = 0,
+    parameter TX_EARLY_PREPARE = 0,
     parameter CLK_HZ       = 100_000_000,
     parameter EXTERNAL_MAC = 0,            // 1: 无 FCS 帧接口，连接核心外的 MAC
     parameter N_TX_VL      = 8,
@@ -75,6 +77,7 @@ module afdx_es_core #(
     input  wire               tx_msg_valid,
     input  wire [7:0]         tx_msg_data,
     input  wire               tx_msg_last,
+    input  wire [79:0]        tx_msg_fragment,
     output wire               tx_msg_ready,
     input  wire [33:0]        tx_msg_ep,           // {SOF 时间戳标记, 端点覆盖, UDP 源端口, UDP 目的端口}，末字节采样
     // 应用接收接口
@@ -84,6 +87,7 @@ module afdx_es_core #(
     output wire               rx_msg_last,
     input  wire               rx_msg_ready,
     output wire [SLOT_AW-1:0] rx_msg_len,
+    output wire [31:0]        rx_msg_fragment,
     output wire [7:0]         rx_msg_sn,
     output wire               rx_msg_net,
     output wire [31:0]        rx_msg_src_ip,
@@ -194,8 +198,8 @@ module afdx_es_core #(
     output wire [RX_POOL_LOG+SLOT_AW-BLOCK_AW:0] rx_buffer_messages,
     output wire [RX_POOL_LOG+SLOT_AW-BLOCK_AW:0] rx_buffer_messages_peak
 );
-    localparam MW = (RX_SESSION_META != 0) ? 105 : 9;
-    localparam TMW = 66;                        // 发送描述符元数据 {ep[33:0], UDP 载荷和}
+    localparam MW = (FRAGMENT_ENABLE != 0) ? 137 : ((RX_SESSION_META != 0) ? 105 : 9);
+    localparam TMW = 146;                        // {分片信息[79:0], ep[33:0], UDP 载荷和[31:0]}
 
     // 接收交付在模块内部实现同深度复位副本；其余子模块在此寄存一拍。
     // 本地复位：输入复位再寄存一拍，每个子模块一位独立寄存器（preserve 不合并），负载限于该模块的
@@ -208,7 +212,7 @@ module afdx_es_core #(
     wire [31:0] monotonic_us;
     assign mono_us = monotonic_us;
     afdx_timer #(
-        .CLK_HZ       (CLK_HZ)
+        .CLK_HZ (CLK_HZ)
     ) u_timer (
         .clk          (clk),
         .rst          (rst_l[1]),
@@ -235,7 +239,7 @@ module afdx_es_core #(
     // order, so the result equals deciding them on the way out. An entry is
     // loaded only on tx_put, and taking the head (which depends on the
     // queue's wr_ready) only flips the read pointer and the valid flags.
-    localparam TIW = 34 + TX_VLW + 1 + 8 + 1 + 1 + 32;
+    localparam TIW = 80 + 34 + TX_VLW + 1 + 8 + 1 + 1 + 32;
     reg [TIW-1:0] tx_e0, tx_e1;
     reg tx_e0_same, tx_e1_same;                 // 该项与前一写入项的 VL 相同
     reg tx_wsel, tx_rsel;
@@ -247,8 +251,9 @@ module afdx_es_core #(
     wire txh_last, txh_bad, txh_abort;
     wire [7:0] txh_data;
     wire [33:0] txh_ep;
+    wire [79:0] txh_fragment;
     wire [31:0] txh_sum;
-    assign {txh_ep, txh_vl, txh_last, txh_data, txh_bad, txh_abort, txh_sum} = tx_head;
+    assign {txh_fragment, txh_ep, txh_vl, txh_last, txh_data, txh_bad, txh_abort, txh_sum} = tx_head;
     assign tx_msg_ready = !tx_spare_valid;
     wire tx_put = tx_msg_valid && tx_msg_ready;
     wire tx_take;
@@ -258,7 +263,7 @@ module afdx_es_core #(
     wire [10:0] entry_lmax;
     wire entry_reject = (entry_lmax == 0) || (tx_msg_vl >= N_TX_VL);
     afdx_tx_vl_rom #(
-        .VLW          (TX_VLW)
+        .VLW (TX_VLW)
     ) u_txrom_in (
         .idx       (tx_msg_vl),
         .vlid      (),
@@ -285,7 +290,7 @@ module afdx_es_core #(
     wire [31:0] put_sum = tx_payload_sum +
                           (tx_in_cnt[0] ? {24'd0, tx_msg_data} : {16'd0, tx_msg_data, 8'd0});
     wire put_same = tx_msg_vl == tx_prev_vl;
-    wire [TIW-1:0] tx_entry = {tx_msg_ep, tx_msg_vl, tx_msg_last, tx_msg_data, put_bad, put_abort, put_sum};
+    wire [TIW-1:0] tx_entry = {(FRAGMENT_ENABLE != 0 ? tx_msg_fragment : 80'd0), tx_msg_ep, tx_msg_vl, tx_msg_last, tx_msg_data, put_bad, put_abort, put_sum};
     always @(posedge clk) begin
         if (tx_put) begin
             if (tx_wsel) begin tx_e1 <= tx_entry; tx_e1_same <= put_same; end
@@ -348,8 +353,8 @@ module afdx_es_core #(
     wire [31:0] tx_sum_next = txh_sum;
 
     afdx_msg_queue #(
-        .N_VL         (N_TX_VL),
-        .VLW          (TX_VLW),
+        .N_VL             (N_TX_VL),
+        .VLW              (TX_VLW),
         .DEPTH            (1 << TX_DEPTH_LOG),
         .DW               (TX_DEPTH_LOG),
         .SLOT_AW          (SLOT_AW),
@@ -368,7 +373,7 @@ module afdx_es_core #(
         .wr_data        (txh_data),
         .wr_ready       (txq_wr_ready),
         .wr_commit      (tx_head_valid && txh_last && !tx_bad),
-        .wr_meta        ({txh_ep, tx_sum_next}),
+        .wr_meta        ({txh_fragment, txh_ep, tx_sum_next}),
         .wr_abort       (txq_abort),
         .wr_ovf         (txq_ovf),
         .wr_commit_ok   (txq_commit_ok),
@@ -406,17 +411,19 @@ module afdx_es_core #(
     wire [TX_VLW-1:0] grant_vl;
     wire [1:0] grant_net_en;
     wire [N_TX_VL-1:0] mac_a_bag_open, mac_b_bag_open;
+    wire [N_TX_VL-1:0] mac_a_build_open, mac_b_build_open;
     wire mac_a_sof, mac_b_sof, mac_a_bag_wait, mac_b_bag_wait;
     wire [TX_VLW-1:0] mac_a_sof_vl, mac_b_sof_vl;
     wire stat_lmax_drop;
     reg [N_TX_VL-1:0] tx_pending_a, tx_pending_b;
     wire [N_TX_VL-1:0] tx_egress_ready = ~tx_pending_a & ~tx_pending_b;
-    // 外部 MAC 仅留一份整帧 CDC 存储；BAG 未开时不提前组帧，避免阻塞其它 VL。
+    // 外部 MAC 可在 BAG 前预备整帧；出口按当前帧长度和实际 SOF 控制安全释放。
     wire [N_TX_VL-1:0] tx_wire_eligible = (EXTERNAL_MAC != 0) ?
-        (mac_a_bag_open & mac_b_bag_open) : {N_TX_VL{1'b1}};
+        ((TX_EARLY_PREPARE != 0) ? (mac_a_build_open & mac_b_build_open) :
+         (mac_a_bag_open & mac_b_bag_open)) : {N_TX_VL{1'b1}};
     // 从授权到实际 SOF 保留逐网络信用，防止在首帧尚未出线时再次授权同一 VL。
     // 单网 VL 在另一网从不占信用。旧模式允许提前组帧后在各出口排队；
-    // 外部模式按 tx_wire_eligible 筛选，BAG 打开后才组帧，以省去出口帧副本。
+    // 预备模式保留同 VL 单份未出线信用，避免堆叠同 VL 帧。
     // Credit events are applied one clock later from registered group/lane
     // one-hot decodes, so no VL register drives 2x128 update decoders. The
     // scheduler re-arbitrates only several clocks after an ack.
@@ -462,7 +469,7 @@ module afdx_es_core #(
     wire [19:0] rom_bag_us;
     wire fb_idle, cfg_hold;
     afdx_tx_vl_rom #(
-        .VLW          (TX_VLW)
+        .VLW (TX_VLW)
     ) u_txrom (
         .idx       (cfg_idx),
         .vlid      (cfg_vlid),
@@ -474,8 +481,8 @@ module afdx_es_core #(
         .partition (cfg_partition)
     );
     afdx_tx_cfg_ram #(
-        .N_VL         (N_TX_VL),
-        .VLW          (TX_VLW),
+        .N_VL       (N_TX_VL),
+        .VLW        (TX_VLW),
         .SHARED_BUS (CFG_SHARED_BUS),
         .BUS_BUDGET ((EXTERNAL_MAC != 0) ? 32'd16000000 : 32'd1600000)
     ) u_txcfg (
@@ -612,10 +619,11 @@ module afdx_es_core #(
     wire [1:0] fb_raw_net;
     // Two-entry elastic FIFO breaks the MAC-ready -> payload-RAM path.
     // Carry per-frame scheduling metadata with every byte across the buffer.
-    localparam FBW = 32 + TX_VLW;
+    localparam FBW = 43 + TX_VLW;
     reg [FBW-1:0] fb_fifo_0, fb_fifo_1;
     reg fb_wp, fb_rp;
     reg [1:0] fb_count;
+    wire [10:0] fb_length, fb_raw_length;
     wire [TX_VLW-1:0] fb_vl;
     wire [19:0] fb_bag;
     wire fb_tag, fb_raw_tag;
@@ -623,7 +631,7 @@ module afdx_es_core #(
     wire fb_take = fb_valid && fb_ready;
     assign fb_raw_ready = fb_count != 2;
     assign fb_valid = fb_count != 0;
-    assign {fb_tag,fb_vl,fb_bag,fb_net_en,fb_last,fb_data} = fb_rp ? fb_fifo_1 : fb_fifo_0;
+    assign {fb_length,fb_tag,fb_vl,fb_bag,fb_net_en,fb_last,fb_data} = fb_rp ? fb_fifo_1 : fb_fifo_0;
     always @(posedge clk) begin
         if (rst_c) begin fb_wp <= 0; fb_rp <= 0; fb_count <= 0; end
         else begin
@@ -633,8 +641,8 @@ module afdx_es_core #(
                 default: ;
             endcase
             if (fb_push) begin
-                if (fb_wp) fb_fifo_1 <= {fb_raw_tag,cfg_idx,rom_bag_us,fb_raw_net,fb_raw_last,fb_raw_data};
-                else fb_fifo_0 <= {fb_raw_tag,cfg_idx,rom_bag_us,fb_raw_net,fb_raw_last,fb_raw_data};
+                if (fb_wp) fb_fifo_1 <= {fb_raw_length,fb_raw_tag,cfg_idx,rom_bag_us,fb_raw_net,fb_raw_last,fb_raw_data};
+                else fb_fifo_0 <= {fb_raw_length,fb_raw_tag,cfg_idx,rom_bag_us,fb_raw_net,fb_raw_last,fb_raw_data};
                 fb_wp <= ~fb_wp;
             end
             if (fb_take) fb_rp <= ~fb_rp;
@@ -642,12 +650,13 @@ module afdx_es_core #(
     end
     wire stat_tx_frame;
     afdx_frame_builder #(
-        .N_VL         (N_TX_VL),
-        .VLW          (TX_VLW),
-        .SLOT_AW     (SLOT_AW),
-        .UDP_CSUM_EN (UDP_CSUM_EN),
-        .NET_ID      (NET_ID),
-        .EQ_ID       (EQ_ID)
+        .FRAGMENT_ENABLE (FRAGMENT_ENABLE),
+        .N_VL            (N_TX_VL),
+        .VLW             (TX_VLW),
+        .SLOT_AW         (SLOT_AW),
+        .UDP_CSUM_EN     (UDP_CSUM_EN),
+        .NET_ID          (NET_ID),
+        .EQ_ID           (EQ_ID)
     ) u_fb (
         .clk              (clk),
         .rst              (rst_l[5]),
@@ -669,6 +678,7 @@ module afdx_es_core #(
         .q_rd_len         (txq_rd_len),
         .q_rd_payload_sum (txq_rd_meta[31:0]),
         .q_rd_ep          (txq_rd_meta[65:32]),
+        .q_rd_fragment    (txq_rd_meta[145:66]),
         .cfg_hold         (cfg_hold),
         .q_rd_data        (txq_rd_data),
         .q_rd_valid       (txq_rd_valid),
@@ -679,6 +689,7 @@ module afdx_es_core #(
         .f_last           (fb_raw_last),
         .f_net_en         (fb_raw_net),
         .f_tag            (fb_raw_tag),
+        .f_length         (fb_raw_length),
         .idle             (fb_idle),
         .f_ready          (fb_raw_ready),
         .stat_frame       (stat_tx_frame),
@@ -706,12 +717,13 @@ module afdx_es_core #(
         .b_ready   (rb_ready)
     );
     afdx_mac_tx #(
-        .FIFO_AW      (MAC_FIFO_AW),
-        .IFG          (IFG),
-        .N_VL         (N_TX_VL),
-        .VLW          (TX_VLW),
-        .CLK_HZ       (CLK_HZ),
-        .EXTERNAL_MAC (EXTERNAL_MAC)
+        .EARLY_PREPARE (TX_EARLY_PREPARE),
+        .FIFO_AW       (MAC_FIFO_AW),
+        .IFG           (IFG),
+        .N_VL          (N_TX_VL),
+        .VLW           (TX_VLW),
+        .CLK_HZ        (CLK_HZ),
+        .EXTERNAL_MAC  (EXTERNAL_MAC)
     ) u_mac_tx_a (
         .clk          (clk),
         .rst          (rst_l[7]),
@@ -722,6 +734,7 @@ module afdx_es_core #(
         .in_vl        (fb_vl),
         .in_bag_us    (fb_bag),
         .in_tag       (fb_tag),
+        .in_frame_len (fb_length),
         .tx_last      (mac_a_tx_last),
         .wire_sof     (mac_a_wire_sof),
         .wire_done    (mac_a_wire_done),
@@ -732,18 +745,20 @@ module afdx_es_core #(
         .tx_busy      (mac_a_tx_busy),
         .stat_frame   (stat_tx_a),
         .bag_open     (mac_a_bag_open),
+        .build_open   (mac_a_build_open),
         .stat_sof     (mac_a_sof),
         .stat_sof_vl  (mac_a_sof_vl),
         .stat_sof_tag (tx_sof_tag_a),
         .bag_wait     (mac_a_bag_wait)
     );
     afdx_mac_tx #(
-        .FIFO_AW      (MAC_FIFO_AW),
-        .IFG          (IFG),
-        .N_VL         (N_TX_VL),
-        .VLW          (TX_VLW),
-        .CLK_HZ       (CLK_HZ),
-        .EXTERNAL_MAC (EXTERNAL_MAC)
+        .EARLY_PREPARE (TX_EARLY_PREPARE),
+        .FIFO_AW       (MAC_FIFO_AW),
+        .IFG           (IFG),
+        .N_VL          (N_TX_VL),
+        .VLW           (TX_VLW),
+        .CLK_HZ        (CLK_HZ),
+        .EXTERNAL_MAC  (EXTERNAL_MAC)
     ) u_mac_tx_b (
         .clk          (clk),
         .rst          (rst_l[8]),
@@ -754,6 +769,7 @@ module afdx_es_core #(
         .in_vl        (fb_vl),
         .in_bag_us    (fb_bag),
         .in_tag       (fb_tag),
+        .in_frame_len (fb_length),
         .tx_last      (mac_b_tx_last),
         .wire_sof     (mac_b_wire_sof),
         .wire_done    (mac_b_wire_done),
@@ -764,6 +780,7 @@ module afdx_es_core #(
         .tx_busy      (mac_b_tx_busy),
         .stat_frame   (stat_tx_b),
         .bag_open     (mac_b_bag_open),
+        .build_open   (mac_b_build_open),
         .stat_sof     (mac_b_sof),
         .stat_sof_vl  (mac_b_sof_vl),
         .stat_sof_tag (tx_sof_tag_b),
@@ -788,7 +805,7 @@ module afdx_es_core #(
         assign mac_a_rx_ready = 1'b0;
         assign mac_b_rx_ready = 1'b0;
     afdx_mac_rx #(
-        .FIFO_AW      (MAC_FIFO_AW),
+        .FIFO_AW    (MAC_FIFO_AW),
         .GAP_CYCLES (RX_GAP_CYCLES)
     ) u_mac_rx_a (
         .clk           (clk),
@@ -807,7 +824,7 @@ module afdx_es_core #(
         .stat_ovf      (ma_ovf)
     );
     afdx_mac_rx #(
-        .FIFO_AW      (MAC_FIFO_AW),
+        .FIFO_AW    (MAC_FIFO_AW),
         .GAP_CYCLES (RX_GAP_CYCLES)
     ) u_mac_rx_b (
         .clk           (clk),
@@ -839,14 +856,15 @@ module afdx_es_core #(
     wire rxq_commit_ok;
     generate if (EXTERNAL_MAC != 0) begin : g_parallel_rx_path
         afdx_rx_parallel #(
-            .N_VL        (N_RX_VL),
-            .VLW         (RX_VLW),
-            .MW          (MW),
-            .NET_FROM_SA (NET_FROM_SA),
-            .UDP_CSUM_EN (UDP_CSUM_EN),
-            .IC_EN       (IC_EN),
-            .RM_EN       (RM_EN),
-            .SKEW_MAX_US (SKEW_MAX_US)
+            .FRAGMENT_ENABLE (FRAGMENT_ENABLE),
+            .N_VL            (N_RX_VL),
+            .VLW             (RX_VLW),
+            .MW              (MW),
+            .NET_FROM_SA     (NET_FROM_SA),
+            .UDP_CSUM_EN     (UDP_CSUM_EN),
+            .IC_EN           (IC_EN),
+            .RM_EN           (RM_EN),
+            .SKEW_MAX_US     (SKEW_MAX_US)
         ) u_rx_parallel (
             .clk             (clk),
             .rst             (rst_l[12]),
@@ -885,37 +903,38 @@ module afdx_es_core #(
         wire [7:0] ic_sn;
         wire st_hdr, st_len, st_unk, st_csum;
         afdx_rx_arb u_arb (
-            .a_ts            (mac_a_rx_ts),
-            .b_ts            (mac_b_rx_ts),
-            .out_ts          (),
-            .clk             (clk),
-            .rst             (rst_l[11]),
-            .a_data          (ma_data),
-            .a_valid         (ma_valid),
-            .a_last          (ma_last),
-            .a_ready         (ma_ready),
-            .b_data          (mb_data),
-            .b_valid         (mb_valid),
-            .b_last          (mb_last),
-            .b_ready         (mb_ready),
-            .out_data        (pf_data),
-            .out_valid       (pf_valid),
-            .out_last        (pf_last),
-            .out_net         (pf_net),
-            .out_ready       (pf_ready)
+            .a_ts      (mac_a_rx_ts),
+            .b_ts      (mac_b_rx_ts),
+            .out_ts    (),
+            .clk       (clk),
+            .rst       (rst_l[11]),
+            .a_data    (ma_data),
+            .a_valid   (ma_valid),
+            .a_last    (ma_last),
+            .a_ready   (ma_ready),
+            .b_data    (mb_data),
+            .b_valid   (mb_valid),
+            .b_last    (mb_last),
+            .b_ready   (mb_ready),
+            .out_data  (pf_data),
+            .out_valid (pf_valid),
+            .out_last  (pf_last),
+            .out_net   (pf_net),
+            .out_ready (pf_ready)
         );
 
         // ---------------- 帧解析 + 完整性/冗余 + 接收队列 ----------------
         wire [15:0] lk_vlid; wire lk_hit; wire [RX_VLW-1:0] lk_idx;
         afdx_rx_vl_lookup #(
-            .VLW             (RX_VLW)
+            .VLW (RX_VLW)
         ) u_rxlk (
-            .vlid            (lk_vlid),
-            .hit             (lk_hit),
-            .idx             (lk_idx)
+            .vlid (lk_vlid),
+            .hit  (lk_hit),
+            .idx  (lk_idx)
         );
 
         afdx_rx_parser #(
+            .FRAGMENT_ENABLE (FRAGMENT_ENABLE),
             .N_VL            (N_RX_VL),
             .VLW             (RX_VLW),
             .MW              (MW),
@@ -954,26 +973,26 @@ module afdx_es_core #(
             .stat_full_drop  (st_full)
         );
         afdx_rx_integrity #(
-            .N_VL            (N_RX_VL),
-            .VLW             (RX_VLW),
-            .IC_EN           (IC_EN),
-            .RM_EN           (RM_EN),
-            .SKEW_MAX_US     (SKEW_MAX_US)
+            .N_VL        (N_RX_VL),
+            .VLW         (RX_VLW),
+            .IC_EN       (IC_EN),
+            .RM_EN       (RM_EN),
+            .SKEW_MAX_US (SKEW_MAX_US)
         ) u_ic (
-            .clk             (clk),
-            .rst             (rst_l[13]),
-            .now_us          (monotonic_us),
-            .req             (ic_req),
-            .vl              (ic_vl),
-            .net             (ic_net),
-            .sn              (ic_sn),
-            .resp            (ic_resp),
-            .accept          (ic_accept),
-            .stat_ic_drop    (st_ic),
-            .stat_rm_drop    (st_rm),
-            .init_busy       (),
-            .delivery_done   (1'b0),
-            .delivery_ok     (1'b0)
+            .clk           (clk),
+            .rst           (rst_l[13]),
+            .now_us        (monotonic_us),
+            .req           (ic_req),
+            .vl            (ic_vl),
+            .net           (ic_net),
+            .sn            (ic_sn),
+            .resp          (ic_resp),
+            .accept        (ic_accept),
+            .stat_ic_drop  (st_ic),
+            .stat_rm_drop  (st_rm),
+            .init_busy     (),
+            .delivery_done (1'b0),
+            .delivery_ok   (1'b0)
         );
         assign rx_hdr_events = {1'b0, st_hdr};
         assign rx_len_events = {1'b0, st_len};
@@ -987,8 +1006,8 @@ module afdx_es_core #(
     wire [(RX_VLW>4 ? RX_VLW-4 : 1)-1:0] rxq_ne_group; wire [15:0] rxq_ne_bits; wire rxq_init_busy;
     wire [(N_RX_VL+255)/256-1:0] rxq_ne_regions;
     afdx_msg_queue #(
-        .N_VL         (N_RX_VL),
-        .VLW          (RX_VLW),
+        .N_VL                 (N_RX_VL),
+        .VLW                  (RX_VLW),
         .DEPTH                (1 << RX_DEPTH_LOG),
         .DW                   (RX_DEPTH_LOG),
         .SLOT_AW              (SLOT_AW),
@@ -1037,8 +1056,8 @@ module afdx_es_core #(
 
     wire [MW-1:0] rx_msg_meta; wire st_deliver;
     afdx_rx_deliver #(
-        .N_VL         (N_RX_VL),
-        .VLW          (RX_VLW),
+        .N_VL           (N_RX_VL),
+        .VLW            (RX_VLW),
         .SLOT_AW        (SLOT_AW),
         .MW             (MW),
         .NONEMPTY_RAM   (RX_VLW > 4 ? 1 : 0),
@@ -1072,10 +1091,15 @@ module afdx_es_core #(
         .stat_deliver    (st_deliver),
         .ne_regions      (rxq_ne_regions)
     );
+    generate if (FRAGMENT_ENABLE != 0) begin : g_rx_fragment
+        assign rx_msg_fragment = rx_msg_meta[136:105];
+    end else begin : g_no_rx_fragment
+        assign rx_msg_fragment = 0;
+    end endgenerate
     assign rx_msg_net = rx_msg_meta[8];
     assign rx_msg_sn  = rx_msg_meta[7:0];
-    generate if (RX_SESSION_META != 0) begin : g_rx_session
-        assign {rx_msg_ts, rx_msg_src_ip, rx_msg_sport, rx_msg_dport} = rx_msg_meta[MW-1:9];
+    generate if (RX_SESSION_META != 0 || FRAGMENT_ENABLE != 0) begin : g_rx_session
+        assign {rx_msg_ts, rx_msg_src_ip, rx_msg_sport, rx_msg_dport} = rx_msg_meta[104:9];
     end else begin : g_rx_no_session
         assign {rx_msg_ts, rx_msg_src_ip, rx_msg_sport, rx_msg_dport} = 96'd0;
     end endgenerate

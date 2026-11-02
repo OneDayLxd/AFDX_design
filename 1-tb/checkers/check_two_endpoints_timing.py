@@ -12,7 +12,9 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from check_app_loopback import require
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
 from check_two_endpoints import audit, read_capture, unique
 
 
@@ -92,7 +94,7 @@ def decompose(records, trace):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", required=True, type=int, choices=range(4))
+    parser.add_argument("--scenario", required=True, type=int, choices=range(7))
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
     capture = Path(f"two_endpoints_{args.scenario}.txt")

@@ -53,6 +53,8 @@ module tb_afdx_mac_management;
     always @(posedge clk)
         if(!reset && dut.host_rx_valid && !host_ready) host_stalls<=host_stalls+1;
     afdx_mac_system #(
+        .FRAGMENT_ENABLE     (1),
+        .TX_EARLY_PREPARE    (1),
         .APP_EXTERNAL        (1),
         .TFTP_TIMEOUT_US     (20000),
         .SELFTEST_US         (5000),
@@ -87,6 +89,7 @@ module tb_afdx_mac_management;
         .host_tx_valid               (1'b0),
         .host_tx_data                ('0),
         .host_tx_last                (1'b0),
+        .host_tx_fragment            (80'd0),
         .host_tx_ready               (),
         .host_rx_vl                  (),
         .host_rx_valid               (),

@@ -9,6 +9,7 @@
  *     目的 MAC = 03:00:00:00:VV:VV（VLID）  源 MAC = 02:00:00:NN:EE:(iii)00000（网络号/设备号/接口号）
  *     源 IP   = 10.NN.EE.(000ppppp)（分区号）    目的 IP = 224.224.VV.VV
  *   UDP 载荷和在应用写入队列时计算并随消息保存，组帧只读取一次载荷。
+ *   IP 分片仅首片带 UDP 首部，各片独立序列号；UDP 校验和覆盖完整消息。
  *   描述符可携带 UDP 端点覆盖（管理响应回到请求源端口）和 SOF 时间戳标记，二者在 S_LOAD 锁存。
  *   授权先寄存一拍（S_GRANT）再确认，使运行时配置 RAM 的两级寄存读出在确认前稳定。
  *
@@ -21,6 +22,7 @@
 `timescale 1ns/1ps
 `include "afdx_defs.vh"
 module afdx_frame_builder #(
+    parameter FRAGMENT_ENABLE = 0,
     parameter N_VL        = 8,
     parameter VLW         = 3,
     parameter SLOT_AW     = 11,
@@ -50,6 +52,7 @@ module afdx_frame_builder #(
     input  wire               q_rd_pop_ready,
     input  wire [SLOT_AW-1:0] q_rd_len,
     input  wire [31:0]        q_rd_payload_sum,
+    input  wire [79:0]        q_rd_fragment,
     input  wire [33:0]        q_rd_ep,            // {tag, ep_en, udp_src, udp_dst}
     input  wire               cfg_hold,           // 配置初始化/切换期间不接受新授权
     input  wire [7:0]         q_rd_data,
@@ -62,6 +65,7 @@ module afdx_frame_builder #(
     output reg                f_last,
     output reg  [1:0]         f_net_en,           // 该帧要发送到的网络（bit0=A, bit1=B）
     output reg                f_tag,              // 该帧的 SOF 需要时间戳
+    output wire [10:0]        f_length,
     output wire               idle,               // S_IDLE；cfg_hold 期间保持
     input  wire               f_ready,
     // 统计脉冲
@@ -84,6 +88,7 @@ module afdx_frame_builder #(
 
     reg [4:0]         state;
     assign idle = (state == S_IDLE);
+
     // Descriptor validity may change after a concurrent enqueue. The queue
     // must sample rd_start on the same edge on which validity is observed.
     assign q_rd_start = (state == S_PLD) && q_rd_info_valid;
@@ -95,6 +100,7 @@ module afdx_frame_builder #(
     (* preserve *) reg [VLW-1:0]     cfg_vl, seq_vl;
     reg [10:0]        len;                      // 有效载荷长度
     reg [15:0]        ip_len, udp_len;
+    assign f_length = ip_len < 45 ? 11'd60 : ip_len[10:0] + 11'd15;
     reg [4:0]         pad_cnt;                  // 填充字节数
     reg [5:0]         hdr_idx;                  // 头部字节索引 0..41
     reg [15:0]        ip_csum, udp_csum;
@@ -127,6 +133,11 @@ module afdx_frame_builder #(
         end
     end endgenerate
     reg [15:0]        ip_id;
+    reg [79:0]        fragment;
+    wire fragmented = FRAGMENT_ENABLE != 0 && fragment[79];
+    wire first_fragment = fragment[77:65] == 0;
+    wire [15:0] ip_ident = fragmented ? fragment[64:49] : ip_id;
+    wire [15:0] ip_flags = fragmented ? {2'b00,fragment[78],fragment[77:65]} : 16'd0;
     assign cfg_idx = cfg_vl;
     assign q_rd_vl = vl_l;
     // Checksum pipeline. Its inputs are held from S_CHECK to S_FINAL, so every
@@ -169,10 +180,10 @@ module afdx_frame_builder #(
         case (hdr_fetch_idx[2:0])
             3'd0: hdr_bank[2] <= ip_len[15:8];
             3'd1: hdr_bank[2] <= ip_len[7:0];
-            3'd2: hdr_bank[2] <= ip_id[15:8];
-            3'd3: hdr_bank[2] <= ip_id[7:0];
-            3'd4: hdr_bank[2] <= 8'h00;
-            3'd5: hdr_bank[2] <= 8'h00;
+            3'd2: hdr_bank[2] <= ip_ident[15:8];
+            3'd3: hdr_bank[2] <= ip_ident[7:0];
+            3'd4: hdr_bank[2] <= ip_flags[15:8];
+            3'd5: hdr_bank[2] <= ip_flags[7:0];
             3'd6: hdr_bank[2] <= 8'h01;
             3'd7: hdr_bank[2] <= `AFDX_IP_PROTO_UDP;
         endcase
@@ -209,13 +220,13 @@ module afdx_frame_builder #(
     end
 
     always @(posedge clk) begin
-        ip_a1 <= 20'h4611 + ip_len;
+        ip_a1 <= 20'h4611 + ip_len + ip_flags;
         ip_b1 <= {8'h0A,NET_ID} + {EQ_ID,3'b000,frame_partition};
         udp_a1 <= sum + 32'h0011;
         udp_b1 <= {8'h0A,NET_ID} + {EQ_ID,3'b000,frame_partition};
         udp_c1 <= 32'hE0E0 + frame_vlid;
         udp_d1 <= frame_udp_src + {16'd0,frame_udp_dst};
-        ip_a2 <= ip_a1 + ip_id;
+        ip_a2 <= ip_a1 + ip_ident;
         ip_b2 <= ip_b1 + 20'hE0E0;
         udp_a2 <= udp_a1 + udp_b1;
         udp_c2 <= udp_c1 + udp_d1;
@@ -277,6 +288,7 @@ module afdx_frame_builder #(
             udp_csum       <= 16'd0;
             sum            <= 32'd0;
             ip_id          <= 16'd0;
+            fragment       <= 80'd0;
             f_net_en       <= 2'b00;
             f_tag          <= 1'b0;
             current_sn     <= 8'd1;
@@ -302,6 +314,7 @@ module afdx_frame_builder #(
                 // the previous VL on the first S_LOAD clock (grant_ack high).
                 S_LOAD: if (q_rd_info_valid && !grant_ack) begin         // 等待配置 ROM / 队列长度稳定
                     len   <= q_rd_len[10:0];
+                    fragment <= FRAGMENT_ENABLE != 0 ? q_rd_fragment : 80'd0;
                     frame_vlid <= cfg_vlid;
                     frame_udp_src <= q_rd_ep[32] ? q_rd_ep[31:16] : cfg_udp_src;
                     frame_udp_dst <= q_rd_ep[32] ? q_rd_ep[15:0] : cfg_udp_dst;
@@ -313,11 +326,13 @@ module afdx_frame_builder #(
                     // Only the transition depends on the length comparison;
                     // a dropped frame never uses these fields.
                     sn_valid_l <= sn_selected_valid;
-                    ip_len   <= 16'd28 + len;
-                    udp_len  <= 16'd8 + len;
-                    pad_cnt  <= (len < `AFDX_MIN_PAYLOAD) ? (5'd17 - len[4:0]) : 5'd0;
+                    ip_len   <= (fragmented && !first_fragment ? 16'd20 : 16'd28) + len;
+                    udp_len  <= fragmented ? fragment[48:33] : 16'd8 + len;
+                    pad_cnt  <= fragmented && !first_fragment ?
+                                (len < 25 ? 5'd25 - len[4:0] : 5'd0) :
+                                (len < `AFDX_MIN_PAYLOAD ? 5'd17 - len[4:0] : 5'd0);
                     f_net_en <= frame_net_en;
-                    sum      <= q_rd_payload_sum;
+                    sum      <= fragmented ? fragment[32:1] : q_rd_payload_sum;
                     if (len == 0 || len > frame_lmax || len > `AFDX_MAX_PAYLOAD) begin
                         stat_lmax_drop <= 1'b1;
                         state          <= S_RELEASE;
@@ -344,7 +359,7 @@ module afdx_frame_builder #(
                 S_HDR: begin
                     if (f_ready) begin
                         hdr_idx <= hdr_idx + 1'b1;
-                        if (hdr_idx == 6'd41) state <= S_PLD;
+                        if (hdr_idx == (fragmented && !first_fragment ? 6'd33 : 6'd41)) state <= S_PLD;
                     end
                 end
                 S_PLD: if (q_rd_info_valid) state <= S_PLDRUN;

@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 // 管理面端到端回放驱动：按脚本把 UDP 载荷封装为完整 Ethernet/IPv4/UDP/AFDX 帧（管理 VL，
-// 100 Mbps 字节节拍）注入 AFDX_top，捕获全部发送帧写入文件，由 scripts/mgmt_e2e.py 独立校验。
+// 100 Mbps 字节节拍）注入协议系统，捕获全部发送帧写入文件供独立校验。
 // 内置时间主站模型：master_ns = sim_ns * (1 + drift_ppb/1e9) + offset_ns；
 // SYNC 的 t1 取注入首字节时刻，自动应答模式下收到 DELAY_REQ 后以帧尾时刻为 t4 回 DELAY_RESP。
 // 脚本命令：

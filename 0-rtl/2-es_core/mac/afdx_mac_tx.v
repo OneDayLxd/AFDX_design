@@ -5,11 +5,11 @@
  *
  * Function:
  *   MAC 发送：旧模式使用共享小块帧队列，按实际出口 BAG 轮询选择 VL。
- *   BAG 未到期的 VL 不会挡住其它 VL；同 VL 帧顺序保持不变。
+ *   按 VL BAG 选择和预备帧；同 VL 帧顺序保持不变。
  *   队列读口或外部模式双槽驱动数据阶段，连续就绪时每时钟输出一个字节。
  *   in_tag 随帧保存；带标记帧的 SOF 同时给出 stat_sof_tag，用于时间同步报文的发送时间戳。
  *   EXTERNAL_MAC=1 时直接流入核心外 MAC 的整帧 FIFO，不重复缓存帧载荷；
- *   组帧与线路发送重叠，元数据队列按实际 GMII SOF 更新 BAG；上游按 bag_open 筛选 VL。
+ *   可按帧长提前预备两级存储；元数据队列仍按实际 GMII SOF 更新 BAG。
  *
  * Sub Module:
  *   afdx_crc32
@@ -23,6 +23,7 @@
 `timescale 1ns/1ps
 `include "afdx_defs.vh"
 module afdx_mac_tx #(
+    parameter EARLY_PREPARE = 0,
     parameter FIFO_AW = 12,
     parameter IFG = 12,
     parameter N_VL = 8,
@@ -31,29 +32,31 @@ module afdx_mac_tx #(
     parameter STRICT_BAG = 1,
     parameter EXTERNAL_MAC = 0
 ) (
-    input wire clk,
-    input wire rst,
-    input wire [7:0] in_data,
-    input wire in_valid,
-    input wire in_last,
-    input wire [VLW-1:0] in_vl,
-    input wire [19:0] in_bag_us,
-    input wire in_tag,
-    output wire in_ready,
-    output wire [7:0] tx_data,
-    output wire tx_valid,
-    input wire tx_slot,
-    output wire tx_frame,
-    output wire tx_busy,
-    output reg stat_frame,
-    output wire [N_VL-1:0] bag_open,
-    output reg stat_sof,
-    output reg [VLW-1:0] stat_sof_vl,
-    output reg stat_sof_tag,
-    output wire       tx_last,
-    input  wire       wire_sof,
-    input  wire       wire_done,
-    output wire bag_wait
+    input  wire                  clk,
+    input  wire                  rst,
+    input  wire [7:0]            in_data,
+    input  wire                  in_valid,
+    input  wire                  in_last,
+    input  wire [VLW-1:0]        in_vl,
+    input  wire [19:0]           in_bag_us,
+    input  wire                  in_tag,
+    input  wire [10:0]           in_frame_len,
+    output wire                  in_ready,
+    output wire [7:0]            tx_data,
+    output wire                  tx_valid,
+    input  wire                  tx_slot,
+    output wire                  tx_frame,
+    output wire                  tx_busy,
+    output reg                   stat_frame,
+    output wire [N_VL-1:0]       bag_open,
+    output wire [N_VL-1:0]       build_open,
+    output reg                   stat_sof,
+    output reg  [VLW-1:0]        stat_sof_vl,
+    output reg                   stat_sof_tag,
+    output wire                  tx_last,
+    input  wire                  wire_sof,
+    input  wire                  wire_done,
+    output wire                  bag_wait
 );
     `include "afdx_math.vh"
     localparam SLOT_AW = (FIFO_AW < 11) ? FIFO_AW : 11;
@@ -182,7 +185,7 @@ module afdx_mac_tx #(
     // Two-entry circular input buffer. Queue admission only advances the
     // read pointer; speculative writes touch only the unoccupied tail slot.
     // Keep the last consumed entry selected while empty for queue prefetch.
-    localparam IW = VLW+30;
+    localparam IW = VLW+41;
     reg [IW-1:0] input_e0, input_e1;
     reg input_wsel, input_rsel, input_hsel;
     reg input_valid, input_spare;
@@ -191,7 +194,7 @@ module afdx_mac_tx #(
     wire queue_stage_ready;
     wire input_get = (EXTERNAL_MAC != 0) ? data_take : input_valid && queue_stage_ready;
     wire [IW-1:0] input_head = input_hsel ? input_e1 : input_e0;
-    assign direct_vl = input_head[IW-1:30];
+    assign direct_vl = input_head[IW-1:41];
     assign stream_data = (EXTERNAL_MAC != 0) ? input_head[7:0] : q_data;
     assign stream_valid = (EXTERNAL_MAC != 0) ? input_valid : q_valid;
     assign stream_last = (EXTERNAL_MAC != 0) ? input_head[8] : q_last;
@@ -200,8 +203,8 @@ module afdx_mac_tx #(
         // in_valid includes upstream A/B ready logic. Keep that round trip
         // off the entry enables; input_put alone publishes the sampled data.
         if (!input_spare) begin
-            if (input_wsel) input_e1 <= {in_vl,in_tag,in_bag_us,in_last,in_data};
-            else input_e0 <= {in_vl,in_tag,in_bag_us,in_last,in_data};
+            if (input_wsel) input_e1 <= {in_vl,(EARLY_PREPARE != 0 ? in_frame_len : 11'd0),in_tag,in_bag_us,in_last,in_data};
+            else input_e0 <= {in_vl,(EARLY_PREPARE != 0 ? in_frame_len : 11'd0),in_tag,in_bag_us,in_last,in_data};
         end
     end
     always @(posedge clk) begin
@@ -230,11 +233,12 @@ module afdx_mac_tx #(
         (* preserve *) reg [IW-1:0] queue_entry;
         wire [VLW-1:0] queue_vl;
         wire [19:0] queue_bag;
+        wire [10:0] queue_length;
         wire queue_last, queue_tag;
         wire [7:0] queue_data;
         wire read_start = (state == S_BAG) && q_info_valid;
         assign queue_stage_ready = !queue_valid || queue_ready;
-        assign {queue_vl,queue_tag,queue_bag,queue_last,queue_data} = queue_entry;
+        assign {queue_vl,queue_length,queue_tag,queue_bag,queue_last,queue_data} = queue_entry;
         // 保持空闲时的最后一个队列入口，供同步 RAM 预取。
         always @(posedge clk) begin
             if (rst) queue_valid <= 1'b0;
@@ -311,7 +315,7 @@ module afdx_mac_tx #(
     localparam SCAN_N = (N_VL < 16) ? N_VL : 16;
     // prepare_open sets between 2^PREP_LOG and 2^PREP_LOG-SCAN_N-4 clocks
     // before the deadline; bag_active clears at most SCAN_N+4 clocks after it.
-    localparam PREP_LOG = 6;
+    localparam PREP_LOG = (EARLY_PREPARE != 0 && EXTERNAL_MAC != 0) ? 12 : 6;
     localparam [TW-1:0] PREP_AHEAD = {{(TW-1){1'b0}}, 1'b1} << PREP_LOG;
     // Distinct constant phases prevent synthesis from merging the region
     // counters; each region stores its deadlines with the same phase.
@@ -339,6 +343,7 @@ module afdx_mac_tx #(
     end
     reg [N_VL-1:0] bag_active, prepare_open;
     assign bag_open = ~bag_active;
+    assign build_open = ~bag_active | prepare_open;
     assign ready_requests = nonempty & bag_open;
     assign prepare_requests = nonempty & prepare_open;
     // Warm the descriptor/payload pipeline before expiry (prepare_open).
@@ -629,16 +634,21 @@ module afdx_mac_tx #(
         end
     end endgenerate
 
-    // Exact BAG boundary of the selected VL. A ready-class pick has no running
-    // BAG. A prepare-class pick had bag_active set while no VL was ready, so
-    // its stored deadline lies within the preparation window; the second
-    // deadline copy holds deadline-1, and frame_due opens on the clock
-    // SOF + BAG like the per-VL comparators did. The lookup follows the pick
-    // in S_IDLE; frame_due is valid three clocks after selection, before the
-    // earliest S_DATA clock.
+    // 同步读取选中 VL 的线路时限。旧模式在 BAG 到期后释放首字节；
+    // 预备模式扣除两级整帧存储的最小耗时，仅把准备工作提前。
+    // 实际 GMII SOF 仍不得早于上一 SOF + BAG。
     (* ramstyle = "M4K, no_rw_check" *) reg [TW-1:0] frame_deadline_mem [0:N_VL-1];
     reg [TW-1:0] frame_deadline_read, frame_deadline_m1;
     reg frame_ready_class;
+    reg [10:0] frame_length;
+    reg [11:0] prepare_cycles;
+    // 两级完整帧存储至少需要 2*(长度-1) 拍才可能开始 GMII。
+    // 只提前这一结构下界；停顿或其它排队只会让出线更晚，不能缩短 BAG。
+    always @(posedge clk) begin
+        prepare_cycles <= (EARLY_PREPARE != 0 && EXTERNAL_MAC != 0 && frame_length >= 60) ?
+                          {frame_length,1'b0} - 12'd2 : 12'd0;
+        if (state == S_IDLE && input_valid) frame_length <= input_head[40:30];
+    end
     wire [VLW-1:0] frame_deadline_addr = (state == S_IDLE) ? ((EXTERNAL_MAC != 0) ? direct_vl : pick) : frame_vl;
     wire [TW-1:0] frame_elapsed = cycle_count - frame_deadline_m1;
     always @(posedge clk) begin
@@ -646,7 +656,7 @@ module afdx_mac_tx #(
         frame_deadline_read <= frame_deadline_mem[frame_deadline_addr];
     end
     always @(posedge clk) begin
-        frame_deadline_m1 <= frame_deadline_read;
+        frame_deadline_m1 <= frame_deadline_read - prepare_cycles;
         if (rst) frame_due <= 1'b0;
         else frame_due <= (STRICT_BAG == 0) || frame_ready_class || !frame_elapsed[TW-1];
     end

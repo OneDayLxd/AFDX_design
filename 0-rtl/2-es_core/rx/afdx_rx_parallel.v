@@ -16,6 +16,7 @@
  */
 `timescale 1ns/1ps
 module afdx_rx_parallel #(
+    parameter FRAGMENT_ENABLE = 0,
     parameter N_VL        = 4096,
     parameter VLW         = 12,
     parameter MW          = 105,
@@ -61,11 +62,12 @@ module afdx_rx_parallel #(
     genvar n;
     generate for (n=0; n<2; n=n+1) begin : g_frontend
         afdx_rx_frontend #(
-            .N_VL           (N_VL),
-            .VLW            (VLW),
-            .MW             (MW),
-            .NET_FROM_SA    (NET_FROM_SA),
-            .UDP_CSUM_CHECK (UDP_CSUM_EN)
+            .FRAGMENT_ENABLE (FRAGMENT_ENABLE),
+            .N_VL            (N_VL),
+            .VLW             (VLW),
+            .MW              (MW),
+            .NET_FROM_SA     (NET_FROM_SA),
+            .UDP_CSUM_CHECK  (UDP_CSUM_EN)
         ) u_frontend (
             .clk             (clk),
             .rst             (rst),

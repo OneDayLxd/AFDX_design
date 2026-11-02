@@ -16,6 +16,7 @@
  */
 `timescale 1ns/1ps
 module afdx_rx_frontend #(
+    parameter FRAGMENT_ENABLE = 0,
     parameter N_VL           = 4096,
     parameter VLW            = 12,
     parameter MW             = 105,
@@ -69,18 +70,19 @@ module afdx_rx_frontend #(
     wire lookup_hit;
     wire [VLW-1:0] lookup_idx;
     afdx_rx_vl_lookup #(
-        .VLW  (VLW)
+        .VLW (VLW)
     ) u_lookup (
         .vlid (lookup_vlid),
         .hit  (lookup_hit),
         .idx  (lookup_idx)
     );
     afdx_rx_parser #(
-        .N_VL           (N_VL),
-        .VLW            (VLW),
-        .MW             (MW),
-        .NET_FROM_SA    (NET_FROM_SA),
-        .UDP_CSUM_CHECK (UDP_CSUM_CHECK)
+            .FRAGMENT_ENABLE (FRAGMENT_ENABLE),
+        .N_VL            (N_VL),
+        .VLW             (VLW),
+        .MW              (MW),
+        .NET_FROM_SA     (NET_FROM_SA),
+        .UDP_CSUM_CHECK  (UDP_CSUM_CHECK)
     ) u_parser (
         .clk             (clk),
         .rst             (rst),

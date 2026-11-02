@@ -5,9 +5,10 @@
  *
  * Function:
  *   接收帧解析器（接收管理 / 帧过滤 / UDP-IP 协议处理）：
- *   逐字节解析 AFDX 帧，校验目的 MAC 前缀、以太网类型、IPv4 首部（版本/不分片/协议/首部校验和）、
+ *   逐字节解析 AFDX 帧，校验目的 MAC 前缀、以太网类型和 IPv4 首部；分片模式输出原始 IP 数据，
  *   目的 IP 与 VLID 一致性、IP/UDP 长度一致性、UDP 校验和；根据 VLID 查表得到接收队列号；
- *   把 UDP 有效载荷写入接收队列，帧尾取出序列号后交由完整性检查/冗余管理裁决，通过则提交，否则丢弃。
+ *   分片单独检查 IP 长度与标记，整包 UDP 校验由后级重组处理。
+ *   把 UDP 有效载荷或分片 IP 数据写入接收队列，帧尾取出序列号后交由完整性检查/冗余管理裁决，通过则提交，否则丢弃。
  *   MW > 9 时描述符附带 UDP 会话元数据：{接收时间戳, 源 IP, 源端口, 目的端口, 网络, 序列号}，
  *   时间戳在帧首字节进入解析器时采样（MAC 已完成 FCS 校验）。
  *
@@ -20,9 +21,10 @@
 `timescale 1ns/1ps
 `include "afdx_defs.vh"
 module afdx_rx_parser #(
+    parameter FRAGMENT_ENABLE = 0,
     parameter N_VL           = 8,
     parameter VLW            = 3,
-    parameter MW             = 9,          // 9 或 9+96（带会话元数据）
+    parameter MW             = 9,          // 基础 9、会话 105、分片会话 137 位
     parameter NET_FROM_SA    = 0,          // 1: 从源 MAC 接口号判定网络（单总线复用 A/B）
     parameter UDP_CSUM_CHECK = 1
 ) (
@@ -66,6 +68,8 @@ module afdx_rx_parser #(
     reg [2:0]  state;
     reg [13:0] bi;                                  // 帧内字节索引
     reg [15:0] vlid, ip_len, udp_len, udp_csum_f;
+    reg [15:0] ip_id, ip_flags;
+    wire fragmented = FRAGMENT_ENABLE != 0 && (ip_flags[13] || ip_flags[12:0] != 0);
     reg [7:0]  sn;
     reg        net_l;
     reg        hdr_err, len_err, vl_unk, full_drop;
@@ -82,7 +86,8 @@ module afdx_rx_parser #(
     assign lk_vlid  = {vlid[15:8], in_data};
     assign q_wr_vl  = idx_l;
     reg [15:0] pld_end; // computed when the UDP length arrives, before payload
-    wire        in_pld  = (bi >= 14'd42) && ({2'b00, bi} < pld_end);
+    wire        in_pld = fragmented ? (bi >= 34 && {2'b00,bi} < 16'd14 + ip_len) :
+                                        (bi >= 42 && {2'b00,bi} < pld_end);
     wire        pld_write = beat & in_pld & ~in_last & ~vl_unk & ~full_drop & ~hdr_err;
     // Payload bytes reach the queue one clock later from registers. A refused
     // byte is seen then: the frame is dropped and aborted as before, and at
@@ -98,7 +103,10 @@ module afdx_rx_parser #(
     end
     reg [31:0] src_ip, rx_ts;
     reg [15:0] udp_sport, udp_dport;
-    generate if (MW > 9) begin : g_session_meta
+    generate if (FRAGMENT_ENABLE != 0) begin : g_fragment_meta
+        assign q_wr_meta = {fragmented,ip_flags[13],ip_id,ip_flags[12:0],1'b0,
+                            rx_ts,src_ip,udp_sport,udp_dport,net_l,sn};
+    end else if (MW > 9) begin : g_session_meta
         assign q_wr_meta = {rx_ts, src_ip, udp_sport, udp_dport, net_l, sn};
     end else begin : g_basic_meta
         assign q_wr_meta = {net_l, sn};
@@ -113,7 +121,9 @@ module afdx_rx_parser #(
     reg        len_consistent;
     always @(posedge clk) begin
         exp_last <= ((16'd14 + ip_len) < 16'd59) ? 16'd59 : (16'd14 + ip_len);
-        len_consistent <= (ip_len == udp_len + 16'd20) && (udp_len >= 16'd9) && (udp_len <= 16'd1479);
+        len_consistent <= fragmented ?
+            (ip_len > 20 && ip_len <= 1499 && (!ip_flags[13] || ip_len[2:0] == 3'd4)) :
+            (ip_len == udp_len + 16'd20 && udp_len >= 9 && udp_len <= 1479);
     end
 
     // 校验和折叠
@@ -121,7 +131,7 @@ module afdx_rx_parser #(
     reg [15:0] ip_f2, udp_f2;
     reg [31:0] udp_pseudo, udp_t;
     wire ip_csum_ok = ip_f2 == 16'hffff;
-    wire udp_csum_ok = (UDP_CSUM_CHECK == 0) || (udp_csum_f == 0) || (udp_f2 == 16'hffff);
+    wire udp_csum_ok = fragmented || (UDP_CSUM_CHECK == 0) || (udp_csum_f == 0) || (udp_f2 == 16'hffff);
     wire frame_reject = hdr_err || !ip_csum_ok || len_err || vl_unk || !udp_csum_ok || full_drop;
     wire [31:0] add_hi = {16'd0, in_data, 8'd0};
     wire [31:0] add_lo = {24'd0, in_data};
@@ -141,7 +151,7 @@ module afdx_rx_parser #(
             state <= S_RX;
             bi <= 14'd0;
             vlid <= 16'd0; ip_len <= 16'd0; udp_len <= 16'd0; udp_csum_f <= 16'd0;
-            sn <= 8'd0; net_l <= 1'b0;
+            sn <= 8'd0; net_l <= 1'b0; ip_id <= 0; ip_flags <= 0;
             hdr_flags <= 0; len_err <= 1'b0; vl_unk <= 1'b0; full_drop <= 1'b0;
             idx_l <= {VLW{1'b0}};
             ip_sum <= 32'd0; udp_sum <= 32'd0; pld_end <= 0;
@@ -194,8 +204,19 @@ module afdx_rx_parser #(
                             14'd14: if (in_data != 8'h45) hdr_flags[4] <= 1'b1;
                             14'd16: ip_len[15:8] <= in_data;
                             14'd17: ip_len[7:0]  <= in_data;
-                            14'd20: if (in_data[5:0] != 6'd0) hdr_flags[5] <= 1'b1;   // 不支持分片
-                            14'd21: if (in_data != 8'h00) hdr_flags[6] <= 1'b1;
+                            14'd18: ip_id[15:8] <= in_data;
+                            14'd19: ip_id[7:0] <= in_data;
+                            14'd20: begin
+                                ip_flags[15:8] <= in_data;
+                                if (FRAGMENT_ENABLE != 0) begin
+                                    if (in_data[7] || (in_data[6] && in_data[5:0] != 0)) hdr_flags[5] <= 1;
+                                end else if (in_data[5:0] != 0) hdr_flags[5] <= 1;
+                            end
+                            14'd21: begin
+                                ip_flags[7:0] <= in_data;
+                                if ((FRAGMENT_ENABLE == 0 && in_data != 0) ||
+                                    (FRAGMENT_ENABLE != 0 && ip_flags[14] && in_data != 0)) hdr_flags[6] <= 1;
+                            end
                             14'd23: if (in_data != `AFDX_IP_PROTO_UDP) hdr_flags[7] <= 1'b1;
                             14'd30, 14'd31: if (in_data != 8'hE0) hdr_flags[8] <= 1'b1;
                             14'd32: if (in_data != vlid[15:8]) hdr_flags[9] <= 1'b1;

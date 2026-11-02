@@ -10,7 +10,7 @@ module tb_afdx_scale;
     localparam NR = `AFDX_N_RX_VL, RW = `AFDX_RX_VLW;
     localparam ROUNDS = 4;
     reg clk = 0, rst = 1;
-    always #5 clk = ~clk;
+    always #4 clk = ~clk;
     reg [TW-1:0] tx_msg_vl = 0;
     reg tx_msg_valid = 0, tx_msg_last = 0;
     reg [7:0] tx_msg_data = 0;
@@ -31,7 +31,13 @@ module tb_afdx_scale;
     wire [31:0] fcs_err, hdr_err, len_err, csum_err, mac_ovf, unknown, lmax_drop;
     wire [8:0] tx_used, rx_used, tx_peak, rx_peak, tx_msgs_peak, rx_msgs_peak;
     localparam TX_VLW_TIE = TW;
-    afdx_es_core #(.N_TX_VL(NT), .TX_VLW(TW), .N_RX_VL(NR), .RX_VLW(RW)) dut (
+    afdx_es_core #(
+        .CLK_HZ  (125_000_000),
+        .N_TX_VL (NT),
+        .TX_VLW  (TW),
+        .N_RX_VL (NR),
+        .RX_VLW  (RW)
+    ) dut (
         .cnt_rx_mac_error          (),
         .mgmt_window               (),
         .mac_a_tx_last             (),

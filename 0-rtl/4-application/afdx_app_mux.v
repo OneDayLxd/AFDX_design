@@ -19,6 +19,7 @@
 
 `timescale 1ns/1ps
 module afdx_app_mux #(
+    parameter FRAGMENT_ENABLE = 0,
     parameter VLW = 3,
     parameter MGMT_STARVE = 4
 ) (
@@ -28,6 +29,7 @@ module afdx_app_mux #(
     input  wire           app_valid,
     input  wire [7:0]     app_data,
     input  wire           app_last,
+    input  wire [79:0]    app_fragment,
     output wire           app_ready,
     input  wire [VLW-1:0] mgmt_vl,
     input  wire           mgmt_valid,
@@ -41,6 +43,7 @@ module afdx_app_mux #(
     output wire [7:0]     out_data,
     output wire           out_last,
     output wire [33:0]    out_ep,
+    output wire [79:0]    out_fragment,
     input  wire           out_ready
 );
     // 仲裁与数据分两拍：未锁定时只做选择并锁定（本拍不传数据），锁定后按寄存的选择逐拍传送，
@@ -52,17 +55,17 @@ module afdx_app_mux #(
     wire mgmt_turn = mgmt_valid && mgmt_allow && (!app_valid || starve_hit);
 
     // Register the complete stream beat in a two-entry buffer.
-    localparam BW = VLW + 9 + 34;
+    localparam BW = VLW + 9 + 34 + 80;
     reg [BW-1:0] head_data, spare_data;
     reg head_valid, spare_valid;
     wire selected_valid = locked && (select_mgmt ? mgmt_valid : app_valid);
     wire selected_last = select_mgmt ? mgmt_last : app_last;
-    wire [BW-1:0] selected_data = select_mgmt ? {mgmt_ep,mgmt_vl,mgmt_last,mgmt_data} :
-                                                {34'd0,app_vl,app_last,app_data};
+    wire [BW-1:0] selected_data = select_mgmt ? {80'd0,mgmt_ep,mgmt_vl,mgmt_last,mgmt_data} :
+                                                {(FRAGMENT_ENABLE != 0 ? app_fragment : 80'd0),34'd0,app_vl,app_last,app_data};
     wire selected_ready = !spare_valid;
     wire put = selected_valid && selected_ready;
     wire take = head_valid && out_ready;
-    assign {out_ep,out_vl,out_last,out_data} = head_data;
+    assign {out_fragment,out_ep,out_vl,out_last,out_data} = head_data;
     assign out_valid = head_valid;
     assign mgmt_ready = locked && select_mgmt && selected_ready;
     assign app_ready = locked && !select_mgmt && selected_ready;

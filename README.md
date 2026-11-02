@@ -1,8 +1,10 @@
-> 生成时间：2026-10-24 15:36
+> 生成时间：2026-11-02 16:40
 
 # AFDX_design
 
-AFDX 端系统 RTL 与验证代码。当前生产入口为 [AFDX_top.v](0-rtl/5-top/AFDX_top.v)，采用单个 125MHz 时钟、应用载荷接口及独立 A/B GMII 网络扩展。MAC 使用工程内的 `gmii_mac_minimal` 重构内核和 `afdx_gmii_mac` 适配器，固定千兆全双工；运行时不依赖外部厂商 IP、网表、原语库或 MDIO。
+AFDX 端系统 RTL 与验证代码。当前生产入口为 [AFDX_es.v](0-rtl/5-AFDX_es/AFDX_es.v)，采用单个 125MHz 时钟、应用载荷接口及独立 A/B GMII 网络扩展。MAC 使用工程内的 `gmii_mac_minimal` 重构内核和 `afdx_gmii_mac` 适配器，固定千兆全双工；运行时不依赖外部厂商 IP、网表、原语库或 MDIO。
+
+仿真应用封装为 [AFDX_top.sv](0-rtl/6-top/AFDX_top.sv)，内部仅例化两个相同的 `AFDX_es`，A/B 的 TX/RX 数据、有效和错误信号分别交叉直连，不增加传输周期或交换延迟。TB 驱动应用消息，故障和延迟对照由 TB 单独注入。综合时选择 `AFDX_es`，不编译双端系统验收封装。
 
 本 README 主要说明代码组织和阅读方式，不作为全部竞赛指标已达标的声明。
 
@@ -14,7 +16,7 @@ Git 只追踪 `0-rtl/`、`1-tb/`、`.gitignore` 和本 README。
 0-rtl/
 ├─ 0-common/                  消息队列、帧缓存、CRC、仲裁和时基
 │  └─ include/                协议常量、数学函数头文件
-├─ 1-config/                  VL 参数、静态配置 ROM、运行时配置 RAM
+├─ 1-config/                  VL 参数、静态配置 ROM、接收 VLID 逆映射、运行时配置 RAM
 ├─ 2-es_core/
 │  ├─ afdx_es_core.v          AFDX 发送和接收核心
 │  ├─ tx/                     BAG 调度、相位控制、组帧、冗余复制
@@ -27,8 +29,9 @@ Git 只追踪 `0-rtl/`、`1-tb/`、`.gitignore` 和本 README。
 │  ├─ snmp/                   SNMP 解析、MIB 查找和响应编码
 │  ├─ loader/                 TFTP 服务与加载/卸载对象管理
 │  └─ rtc/                    RTC 计时与网络时间同步
-├─ 4-application/             应用输入缓存、消息发生器、接收槽及应用/管理仲裁
-└─ 5-top/                     系统集成和生产顶层
+├─ 4-application/             应用封装、共享字节缓存、IP 分片/重组及管理仲裁
+├─ 5-AFDX_es/                 单个可综合端系统：AFDX_es、afdx_mac_system、afdx_system
+└─ 6-top/                     AFDX_top.sv：两个端系统的 A/B GMII 直连验收封装
 
 1-tb/
 ├─ tb_afdx_*.sv               单元、协议、集成和压力测试
@@ -41,15 +44,28 @@ Git 只追踪 `0-rtl/`、`1-tb/`、`.gitignore` 和本 README。
 
 这是功能目录，不是严格的实例树；公共模块可以被多个路径复用。
 
-本地还可保留 `2-sim/`、`3-constraints/`、`4-elinx/`、`docs/`、`lint_work/` 和编辑器配置，它们不随仓库保存。因此仅克隆本仓库不会获得完整的本机仿真启动脚本、eLinx 工程和板级约束。
+本地还可保留 `2-sim/`、`3-constraints/`、`4-AFDX_es_synth/`、`5-data/`、`docs/`、`lint_work/` 和编辑器配置，它们不随仓库保存。`2-sim/` 保留仿真启动脚本、源码清单及配置；`4-AFDX_es_synth/` 保留当前单端系统综合工程及源码刷新、核对脚本；`5-data/results/` 保存已归档的日志、抓包和统计结果，`5-data/history/` 保存历史快照和开发辅助脚本。因此仅克隆本仓库不会获得完整的本机仿真启动脚本、eLinx 工程、约束和结果数据。
 
 ## 2. 从顶层理解模块关系
 
-下面只列主要实例，省略配置 ROM、公共计数器和辅助缓冲：
+端到端验证层次：
 
 ```text
-AFDX_top
-├─ u_app_ingress : afdx_app_ingress    valid-only 输入消息缓存
+tb_afdx_two_endpoints
+└─ dut : AFDX_top
+   ├─ g_endpoint[0].u_es : AFDX_es
+   └─ g_endpoint[1].u_es : AFDX_es
+      两端的 A 网互连、B 网互连；两个方向均可同时通信
+```
+
+下面列出单个端系统的主要实例，省略配置 ROM、公共计数器和辅助缓冲：
+
+```text
+AFDX_es
+├─ u_app_tx : afdx_app_tx_adapter      VLID 首部解析、配置索引查找及完整消息缓存
+│  ├─ u_buffer : afdx_app_ingress      完整消息缓存、长度与全消息校验和
+│  └─ g_fragment.u_fragment            按 VL Lmax 切分 IPv4 数据报
+├─ u_app_rx : afdx_app_rx_adapter      接收索引还原 VLID、应用消息封装
 └─ u_mac_system : afdx_mac_system
    ├─ u_system : afdx_system
    │  ├─ u_gen     : afdx_app_gen       内部应用发送源
@@ -61,24 +77,27 @@ AFDX_top
    └─ g_net[1].u_link : afdx_gmii_mac   B 网适配器（内含 gmii_mac_minimal）
 ```
 
-- [AFDX_top.v](0-rtl/5-top/AFDX_top.v)：正式应用载荷端口及 A/B 网络扩展，固定时钟参数并处理 ready 兼容语义。
+- [AFDX_es.v](0-rtl/5-AFDX_es/AFDX_es.v)：正式应用载荷端口及 A/B 网络扩展，固定时钟参数并处理 ready 兼容语义。
 - [afdx_app_ingress.v](0-rtl/4-application/afdx_app_ingress.v)：完整消息缓存，将 valid-only 应用输入转换为内部握手流。
-- [afdx_mac_system.v](0-rtl/5-top/afdx_mac_system.v)：连接协议系统与两路 MAC；保留 host 应用接口供测试使用。
-- [afdx_system.v](0-rtl/5-top/afdx_system.v)：集成应用、管理面和协议核心；正式路径采用 `EXTERNAL_MAC=1`，通过两组独立帧流连接核心外的 MAC 适配器。
+- [afdx_app_tx_adapter.v](0-rtl/4-application/afdx_app_tx_adapter.v)：解析两字节大端 VLID，比较配置 ROM 后寄存，经平衡选择树得到内部发送索引；拒绝未知 VLID、截断首部和空载荷消息。
+- [afdx_app_rx_adapter.v](0-rtl/4-application/afdx_app_rx_adapter.v)：将内部接收索引转换为实际 VLID，先输出 VLID，再输出载荷。
+- [afdx_mac_system.v](0-rtl/5-AFDX_es/afdx_mac_system.v)：连接协议系统与两路 MAC；保留 host 应用接口供测试使用。
+- [afdx_system.v](0-rtl/5-AFDX_es/afdx_system.v)：集成应用、管理面和协议核心；正式路径采用 `EXTERNAL_MAC=1`，通过两组独立帧流连接核心外的 MAC 适配器。
 - [afdx_es_core.v](0-rtl/2-es_core/afdx_es_core.v)：发送队列/BAG 调度，以及接收解析、完整性检查、冗余管理和消息交付。
 - [gmii_mac_minimal.v](0-rtl/2-es_core/mac/gmii_mac_minimal.v)：从队友提供的同名 RTL 复制，保留锁定参考的功能逻辑；仅规范文件头和端口格式，来源哈希见文件头。
 - [afdx_gmii_mac.v](0-rtl/2-es_core/mac/afdx_gmii_mac.v)：TX 整帧缓存和 ready 限定 valid，RX 末字节保留/错误裁决与整帧缓存，线路时间戳、首尾反馈及统计。原始 RX 无反压，适配器在消息交给协议核心前丢弃坏帧、长短帧及缓存溢出帧。
 
 适配器在线路侧锁存整个帧期间的 RX_ER，覆盖内核不报告的前导码 PHY 错误。外层仍执行至少七字节前导码、60..1514 字节无 FCS 帧体的策略。默认每网保留外层四槽 TX FIFO，再经过内核双银行 4KiB RAM；因此增加了缓存资源和一段整帧发送等待，不能将此次替换当作时延优化。MAC 的 SOF/EOF 反馈来自实际线路包络；内核反相 TX 时钟输出在当前单时钟仿真入口未使用。
 
-生产顶层采用 `APP_EXTERNAL=1`、关闭内部演示发生器；应用输入经 `afdx_app_ingress` 接入 `host_tx_*`，`host_rx_*` 直接交付应用。`host_*` 保留内部 valid/ready 握手，外部模板端口不使用 ready 握手。旧测试仍可在 MAC 集成层使用内部发生器和接收槽。
+生产顶层采用 `APP_EXTERNAL=1`、关闭内部演示发生器；应用输入经发送适配器和消息缓存接入 `host_tx_*`，`host_rx_*` 经接收适配器交付应用。`host_*` 保留内部 valid/ready 握手，外部应用端口不使用 ready 握手。旧测试仍可在 MAC 集成层使用内部发生器和接收槽。
 
 ## 3. 一条消息如何发送与接收
 
 ### 发送方向
 
 ```text
-rx_data/rx_valid/rx_vl/rx_last → 输入完整消息缓存
+tx_data/tx_valid/tx_last（VLID + 载荷）→ VLID 查表 → 输入完整消息缓存
+  → afdx_ip_fragment_tx：长消息切片（短消息保持单帧）
   → 应用载荷 / 管理响应
   → afdx_app_mux：仲裁消息来源
   → afdx_msg_queue：按 VL 缓存消息
@@ -92,6 +111,8 @@ rx_data/rx_valid/rx_vl/rx_last → 输入完整消息缓存
 
 发送调度默认使用快照轮询；`TX_PHASE_ENABLE=1` 为可选相位模式，需要明确的业务相位和突发约束。不能只打开该参数就认定所有任意负载的抖动都满足要求。
 
+生产模式默认启用 `TX_EARLY_PREPARE=1`：在 BAG 到期前预备组帧，按当前帧长度计算两级完整帧存储的安全提前量，避免每个 BAG 后再累积一段组帧等待。实际 GMII 的同 VL 帧间隔仍逐帧检查，不通过缩短 BAG 降低时延。该优化不改动队友的 MAC 内核。
+
 ### 接收方向
 
 ```text
@@ -103,7 +124,8 @@ a_gmii_rx_* / b_gmii_rx_*
       └─ afdx_rx_integrity：共享完整性检查与冗余去重
   → afdx_msg_queue：保存通过检查的有效消息
   → afdx_rx_deliver：选择并交付消息
-  → 应用 tx_data/tx_valid/tx_vl/tx_last / 管理协议处理
+  → afdx_ip_reassembly：分片重组与整包 UDP 校验（短消息透传）
+  → 接收索引逆映射 → 应用 rx_data/rx_valid/rx_last（VLID + 载荷）/ 管理协议处理
 ```
 
 A/B 是同一逻辑消息的两个网络副本，不是应用需要接收两次。共享去重在消息池成功提交后才确认交付状态，避免提交失败后误丢另一副本。
@@ -115,64 +137,56 @@ A/B 是同一逻辑消息的两个网络副本，不是应用需要接收两次�
 模板接口是应用数据接口，不能再把 `tx_data/rx_data` 当作 GMII：
 
 - `clk`：125MHz，单时钟；`rst`：高有效同步复位。
-- 输入 `rx_data/rx_valid/rx_vl/rx_last`：应用提交待发送的 UDP 载荷。`rx_vl` 是发送配置索引（生产配置 7 位），不是 16 位 VLID。
-- 输出 `tx_data/tx_valid/tx_vl/tx_last`：向应用交付通过校验、去重后的载荷。`tx_vl` 是接收配置索引（生产配置 12 位）。当前管理面也旁路观察接收流，不对应用输出额外隐藏管理消息。
-- `valid=1` 接收一个字节；`last` 仅在 valid 有效时表示末字节。消息内 VL 不变，允许 valid 空洞，不允许消息交织。零字节消息不编码。
-- `tx_ready=1` 仅为模板兼容值，不表示容量无限。`rx_ready` 不使用，应用必须接收每一个 `tx_valid` 字节。
-- 输入默认 16 个 2048 字节物理槽（32KiB），每消息最多 1471 字节；整条到齐才提交。每 VL 的运行时 Lmax、核心池容量仍由协议核心约束。
-- 输入满、超长、非法/中途变化的 VL 均整条丢弃，直到有效 last 才恢复下一条；`app_drop` 脉冲、累计 `app_drop_count` 报告一次拒绝。`app_drop_reason[0/1/2]` 分别为满/超长/VL 错误，可以同时置位。它们不是全系统丢弃计数；核心后续拒绝由管理统计记录。
+- 输入 `tx_data/tx_valid/tx_last`：应用提交待发送消息。第一个有效字节为 VLID[15:8]，第二个为 VLID[7:0]，其后为 1..8192 字节 UDP 载荷（默认 `APP_MAX_LEN=8192`）；`tx_last` 标记载荷末字节。
+- 输出 `rx_data/rx_valid/rx_last`：以相同的“VLID 高字节、VLID 低字节、载荷”格式交付通过检查、去重的消息。当前管理面也旁路观察接收流，不对应用输出额外隐藏管理消息。
+- `valid=1` 接收一个字节；`last` 仅在 valid 有效时结束消息。首部和载荷均允许 valid 空洞，不允许消息交织。VLID 属于应用封装元数据，不进入 UDP 载荷，也不计入有效载荷吞吐。
+- 两字节大端 VLID 和 last 是本工程明确采用的封装约定；答疑未规定唯一字节编码。配置索引不再暴露为应用端口。当前接收订阅为 0x1000..0x1fff，修改订阅表须同步维护 `afdx_rx_vl_id_rom` 逆映射。
+- `tx_ready=1` 仅为兼容值，不表示容量无限。`rx_ready` 不使用，应用必须接收每一个 `rx_valid` 字节。
+- 输入默认 16 个消息描述符、32KiB 环形共享字节池；按实际长度占用空间，每消息最多 8192 字节，整条到齐才发布。超静态 Lmax 的消息使用 IPv4 分片，每片仍受 VL BAG 与核心容量约束。
+- 输入满、超长、未知 VLID、截断首部或空载荷均整条拒绝；有效 last 恢复下一条。`app_drop` 脉冲、累计 `app_drop_count` 报告一次拒绝。`app_drop_reason[0/1/2]` 分别为满/超长/VLID 或封装错误，可以同时置位。它们不是全系统丢弃计数；核心后续拒绝由管理统计记录。
 - 默认槽位最多同时保留 16 条消息（包括读出中消息）。允许的业务还须满足 VL BAG、Lmax、核心池容量与平均服务速率；不能向有限缓存无限提交而期待无损。
 - 网络扩展 `a_gmii_tx/rx_data/valid/er`、`b_gmii_tx/rx_data/valid/er`：独立 A/B 链路，与 clk 同步。数据包含前导码、SFD、MAC 帧及 FCS；帧内 valid 连续为高，IFG 时 valid=0。
 - 内部 `host_*` 使用 valid/ready，输入缓存负责协议转换；RAM 使用同步读，不复位数据阵列，背压时保持输出。
 
 这是同步千兆字节接口约定，不是任意真实 PHY 的直接上板接口；125MHz × 8bit/拍对应 1Gbps 线路字节节拍，不等于宣称 100Mbps 物理模式已实现。
 
+`AFDX_top` 的应用端口是两路打包总线：data[7:0]对应端点0，data[15:8]对应端点1，valid/last/ready/drop各位按端点索引对应；两个方向均可独立注入和接收。业务格式与单端系统完全相同。
+
+基础连接为零附加延迟的 GMII 直连，仍经过两个端系统的完整 MAC、校验、缓存和调度通路。顶层无网络故障/延迟控制口；TB 的故障场景覆盖接收连线以丢弃单网整帧或翻转字节制造坏 FCS，延迟对照仅在 TB 使用固定 5us 延迟。TB 记录故障计划，检查器与实际线路字节、SFD/EOF 时间戳交叉核对。普通场景要求对端 RX 与源 TX 在同一采样沿数据完全一致。
+
+
 主要配置入口：
 
 - [afdx_cfg_params.vh](0-rtl/1-config/afdx_cfg_params.vh)：生产 VL 数量/位宽和管理窗口宏；当前为 128 TX / 4096 RX VL。
 - [afdx_vl_config.v](0-rtl/1-config/afdx_vl_config.v)：静态 VL 配置 ROM，包含多个配置模块，属于已有的多模块文件。
 - [afdx_tx_cfg_ram.v](0-rtl/1-config/afdx_tx_cfg_ram.v)：运行时 TX 配置。
-- 顶层默认 `MGMT_EN=1`、`TX_PHASE_ENABLE=0`、`APP_SLOT_LOG=4`；内部演示发生器固定关闭。
+- 顶层默认 `MGMT_EN=1`、`TX_PHASE_ENABLE=0`、`TX_EARLY_PREPARE=1`、`APP_SLOT_LOG=4`、`APP_MAX_LEN=8192`；内部演示发生器固定关闭。
 
-部分内部模块仍保留旧模式的 100MHz 默认值，正式顶层通过参数覆盖为 125MHz。历史共享总线路径仍保留，但不是当前 A/B 生产接口。
 
-## 5. 测试代码怎么找
+### 分片与重组的边界
 
-按要理解的功能选择测试入口：
+`afdx_ip_fragment_tx` 产生真正的 IPv4 MF、八字节偏移与统一 IP ID；仅首片携带 UDP 首部。整包 UDP 校验和在完整消息缓存时计算，每个分片独立经过调度、序列号、A/B 复制与 MAC 校验。
 
-| 关注点 | 主要测试文件 |
-| --- | --- |
-| 应用缓存、溢出、背压和指针回卷 | [tb_afdx_app_ingress.sv](1-tb/tb_afdx_app_ingress.sv) |
-| 两个生产顶层双向通信、吞吐及冗余故障 | [tb_afdx_two_endpoints.sv](1-tb/tb_afdx_two_endpoints.sv)、[独立抓包检查器](1-tb/checkers/check_two_endpoints.py) |
-| MAC 集成层双网、ready 兼容与历史回环 | [tb_afdx_mac_top.sv](1-tb/tb_afdx_mac_top.sv) |
-| MAC 适配、FCS、帧缓存、错误与反压边界 | [tb_afdx_gmii_mac.sv](1-tb/tb_afdx_gmii_mac.sv) |
-| A/B 并行接收与共享去重 | [tb_afdx_rx_parallel.sv](1-tb/tb_afdx_rx_parallel.sv) |
-| 快照轮询和管理窗口 | [tb_afdx_tx_snapshot.sv](1-tb/tb_afdx_tx_snapshot.sv)、[tb_afdx_mgmt_window.sv](1-tb/tb_afdx_mgmt_window.sv) |
-| 正常应用发送到应用接收 | [tb_afdx_app_loopback.sv](1-tb/tb_afdx_app_loopback.sv) |
-| 排队、突发、背压及回送时延 | [tb_afdx_load_latency.sv](1-tb/tb_afdx_load_latency.sv) |
-| VL 规模和综合业务诊断 | [tb_afdx_scale.sv](1-tb/tb_afdx_scale.sv)、[tb_afdx_acceptance.sv](1-tb/tb_afdx_acceptance.sv) |
-| 管理协议端到端 | [tb_afdx_mac_management.sv](1-tb/tb_afdx_mac_management.sv)、[stimuli/](1-tb/stimuli/) |
+`afdx_ip_reassembly` 位于共享完整性/去重与应用/管理分流之间。默认四个上下文，以接收 VL、源 IP 和 IP ID 区分数据报，允许乱序，拒绝重叠、越界、长度不符和整包 UDP 校验错误；完整通过后才交付应用。缺片不交付，无重组定时超时；四个上下文耗尽时轮询替换未完成消息，内部计数可观察。长消息并发和输入突发须纳入业务规划。
 
-测试配置和生产配置存在同名模块/头文件，编译时必须选择一套，不能把所有配置 ROM 同时加入工程。`tb_afdx_latency.sv` 是旧单总线时延基线。旧官方 IP/MDIO 适配器及其专用 TB、PHY 管理模型已移除，当前 MAC 内核只使用工程内的 `gmii_mac_minimal`。
+静态配置与运行时 Lmax 应保持一致；修改 Lmax 前应停止并清空相关 VL 的业务，再同步配置。单帧时延/抖动与跨多个 BAG 的长消息完成时间分别记录，不宣称任意突发消息均在 2ms 内完成。答疑第 96 行明确跨多个 BAG 的分片消息完成时间不受该单帧 2ms 限制。
 
-`afdx_mac_tx` 的生产分支负责 VL 的 BAG 计时、发送元数据和实际线路反馈，不能随旧 MAC 删除。`afdx_mac_rx`、串行接收仲裁及 `EXTERNAL_MAC=0` 分支仍供原协议基线测试使用，生产入口固定选择 `EXTERNAL_MAC=1`；旧队列前级和串行解析连线仅在对应分支生成。管理协议、应用输入缓存和 MAC 错误回滚缓存仍是现用功能。
 
-双端测试实例化两个生产 `AFDX_top`（各自含 128 TX / 4096 RX 配置），经四条独立单向网络通道双向通信，不自动回送应用数据。业务使用 VL1..127，VL0 保留管理；基础通道整帧到齐后延迟 A=256ns、B=512ns，另含序列化及排队时间，不模拟电气 PHY。
+## 5. 验证入口
 
-本地 `2-sim/run_TwoEndpoints.ps1` 跑四种场景：0 为 8 VL 变长帧，1 为 127 VL/1471 字节吞吐，2 为单路丢帧/坏 FCS/到达顺序变化，3 为额外 5us 网络延迟。变长集为 17/465/977/1471 字节 UDP 载荷，对应 64/512/1024/1518 字节 MAC 帧。独立检查应用内容、IP/UDP/FCS、BAG、序列号、去重及时间因果，并包含篡改抓包的负对照。
+[测试平台说明](1-tb/README.md)列出当前42个TB的分组。标准回归运行39项单元和集成测试；管理专项及综合后测试分别运行。容量测试以125 MHz逐项检查128条发送VL和4096条接收订阅。
 
-应用时延从输入首字节到远端输出末字节，抖动取同一 VL 多消息时延极差；这些是应用级工程指标，不替代官方 GMII 处理时延口径。应用 2ms/50us 工程检查和有效载荷 100Mbps 吞吐检查分开报告，吞吐仅在专门负载场景判定，每方向独立且 A/B 只计一次。低负载场景的低吞吐不代表带宽能力不足；工程检查失败不会改成通过。
+在交付包的2-sim目录运行run_RtlRegression.ps1、run_TwoEndpoints.ps1和run_ManagementRegression.ps1。仿真清单为flist.f，单端综合清单为rtl_production.f。生产和测试配置ROM定义同名模块，编译时选择对应的一套配置。
 
-历史 `tb_afdx_post_synth.sv` 及现存完整综合网表使用旧网络顶层端口，只能作为旧版本证据；不能直接用于当前应用顶层后仿。小规模后仿 fixture 也不证明新应用适配器已经综合验证。下一次综合须使用更新后的生产清单，并重新生成网表/匹配 TB。
+双端测试采用两个生产AFDX_es的A/B GMII直连；VL0保留管理，业务VL1..127。七个场景覆盖变长、127 VL并发、单网丢帧及坏FCS、TB固定5us延迟、同长度重复、100 Mbps输入和全部业务VL每BAG最大帧。帧长包含64/512/1024/1518 B。
 
-## 6. 建议阅读顺序与修改注意
+时延从源应用首个VLID字节输入至对端对应消息首字节输出；抖动按同VL同帧长分组计算时延极差，包含冷启动。基础业务BAG为2ms、Lmax为1471 B；长消息跨BAG的完成时间单列。输入有效载荷100 Mbps的稳定性、首字节时延小于2ms及抖动小于100us通过相应场景检查。已有原始抓包、逐帧统计及额外诊断值归档在5-data/results；重新运行仿真时，新结果仍生成在2-sim。
 
-1. 先读 `AFDX_top → afdx_app_ingress / afdx_mac_system → afdx_system`，区分应用载荷、内部握手和网络扩展接口。
-2. 再读 `afdx_es_core`，沿发送队列、调度、组帧、A/B 复制理解 TX。
-3. 阅读 `afdx_gmii_mac`，区分核心帧流与含前导码/FCS 的线路帧。
-4. 沿 `afdx_rx_parallel → afdx_rx_frontend / afdx_rx_integrity → afdx_rx_deliver` 理解 RX。
-5. 最后看管理面和上述对应 TB，确认异常处理与检查口径。
+## 6. 阅读顺序
 
-新增生产 RTL 后同步维护本地仿真/综合清单，不要漏编译。正式配置来自 `0-rtl/1-config`，不要用 TB 的小规模配置替换生产配置。eLinx 的导入目录只是副本，代码修改仍在 `0-rtl` 进行，综合前核对副本是否最新。
-
-当前已有功能回归与压力验证，但部分时延/抖动工程检查仍失败；完整器件映射、布局布线和 125MHz 时序收敛尚未完成。TFTP/加载管理不等于完整 ARINC615A/665，协议仿真也不等于物理授时精度已验证。
+1. AFDX_top：理解两个端系统的应用接口与双网连接。
+2. AFDX_es：沿应用适配、共享字节缓存和分片进入afdx_mac_system。
+3. afdx_system及afdx_es_core：理解VL队列、BAG调度、组帧及复制。
+4. afdx_gmii_mac：理解帧流与包含前导码/FCS的GMII线路数据。
+5. afdx_rx_parallel、afdx_rx_integrity、afdx_rx_deliver及afdx_ip_reassembly：理解校验、去重、缓存及完整消息交付。
+6. 管理面和对应TB：理解SNMP、TFTP、RTC与Trap。

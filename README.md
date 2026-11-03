@@ -1,5 +1,3 @@
-> 生成时间：2026-11-02 16:40
-
 # AFDX_design
 
 AFDX 端系统 RTL 与验证代码。当前生产入口为 [AFDX_es.v](0-rtl/5-AFDX_es/AFDX_es.v)，采用单个 125MHz 时钟、应用载荷接口及独立 A/B GMII 网络扩展。MAC 使用工程内的 `gmii_mac_minimal` 重构内核和 `afdx_gmii_mac` 适配器，固定千兆全双工；运行时不依赖外部厂商 IP、网表、原语库或 MDIO。
